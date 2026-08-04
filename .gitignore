@@ -1,0 +1,23 @@
+# secrets
+.env.db
+.env.erpnext
+.env
+
+# runtime artifacts
+data/
+*.sqlite
+*.sqlite-journal
+*.log
+*.xml
+*.pdf
+config.local.yaml
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# unrelated local projects / IDE
+z2crm/
+.claude/

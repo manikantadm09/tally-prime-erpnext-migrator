@@ -1,0 +1,2 @@
+from frappe.utils.background_jobs import get_queue; print({"default": get_queue("default").count, "short": get_queue("short").count, "long": get_queue("long").count})
+exit

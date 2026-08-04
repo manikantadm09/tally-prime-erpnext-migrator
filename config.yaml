@@ -1,0 +1,119 @@
+# ============================================================================
+# Tally -> ERPNext migration configuration
+# ============================================================================
+# Secrets live in .env.db and .env.erpnext (gitignored). This file holds the
+# non-secret mapping/runtime configuration only.
+
+tally:
+  url: "http://127.0.0.1:9000"
+  company: "YOUR TALLY COMPANY"    # Tally company to export (must be loaded/open)
+  from_date: "20240101"             # yyyymmdd; set the first source date to migrate
+  to_date:   "20241231"             # yyyymmdd; set the approved migration cut-off
+  request_timeout: 180             # seconds; large voucher exports can be slow
+  page_size: 0                     # 0 = export whole collection in one request
+
+erpnext:
+  company: "YOUR ERPNext COMPANY"  # isolated ERPNext sandbox target
+  default_currency: "INR"
+  country: "India"
+  company_state: ""
+  # TallyPrime 7 stores multi-registration GSTIN data in Tax Unit masters. This
+  # value is populated from that source when available; leave blank rather than
+  # inventing a tax identity.
+  company_gstin: ""
+  # Tally's reserved "Profit & Loss A/c" and all Period Closing Vouchers map to
+  # this standard target leaf.
+  retained_earnings_account: "Reserves and Surplus"
+  # Fallback control/clearing accounts used when a Tally ledger cannot be
+  # resolved to a concrete ERPNext account (kept out of normal flow; flagged
+  # in the reconciliation report so nothing is silently dropped).
+  rounding_account: "Round Off"
+  batch_size: 50                   # docs per REST batch where batching is used
+
+# Custom field added to every migrated doctype so the migration is idempotent
+# and reversible. Stores the Tally GUID of the source master/voucher.
+idempotency_field: "tally_guid"
+
+# ----------------------------------------------------------------------------
+# Tally primary group  ->  ERPNext (root_type, account_type)
+# Root types: Asset | Liability | Equity | Income | Expense
+# account_type is an ERPNext hint (Receivable, Payable, Bank, Cash, Tax, ...)
+# Sub-groups inherit their parent's root_type unless overridden in group_overrides.
+# ----------------------------------------------------------------------------
+root_type_map:
+  "Capital Account":            { root_type: Equity,    account_type: "" }
+  "Loans (Liability)":          { root_type: Liability, account_type: "" }
+  "Current Liabilities":        { root_type: Liability, account_type: "" }
+  "Current Assets":             { root_type: Asset,     account_type: "" }
+  "Fixed Assets":               { root_type: Asset,     account_type: "Fixed Asset" }
+  "Investments":                { root_type: Asset,     account_type: "" }
+  "Misc. Expenses (ASSET)":     { root_type: Asset,     account_type: "" }
+  "Suspense A/c":               { root_type: Liability, account_type: "" }
+  "Branch / Divisions":         { root_type: Liability, account_type: "" }
+  "Sales Accounts":             { root_type: Income,    account_type: "" }
+  "Purchase Accounts":          { root_type: Expense,   account_type: "" }
+  "Direct Incomes":             { root_type: Income,    account_type: "" }
+  "Income (Direct)":            { root_type: Income,    account_type: "" }
+  "Indirect Incomes":           { root_type: Income,    account_type: "" }
+  "Income (Indirect)":          { root_type: Income,    account_type: "" }
+  "Direct Expenses":            { root_type: Expense,   account_type: "" }
+  "Expenses (Direct)":          { root_type: Expense,   account_type: "" }
+  "Indirect Expenses":          { root_type: Expense,   account_type: "" }
+  "Expenses (Indirect)":        { root_type: Expense,   account_type: "" }
+
+# Sub-group name -> account_type hint (root_type inherited from ancestor)
+group_overrides:
+  "Sundry Debtors":   { account_type: "Receivable" }
+  "Sundry Creditors": { account_type: "Payable" }
+  "Bank Accounts":    { account_type: "Bank" }
+  "Bank OD A/c":      { account_type: "Bank" }
+  "Bank OCC A/c":     { account_type: "Bank" }
+  "Cash-in-hand":     { account_type: "Cash" }
+  "Cash-in-Hand":     { account_type: "Cash" }
+  "Duties & Taxes":   { account_type: "Tax" }
+  "Stock-in-hand":    { account_type: "Stock" }
+
+# Tally party group -> ERPNext party kind
+party_groups:
+  customer: ["Sundry Debtors"]
+  supplier: ["Sundry Creditors"]
+
+# ----------------------------------------------------------------------------
+# Voucher type (Tally) -> ERPNext target doctype + mode
+# ----------------------------------------------------------------------------
+voucher_map:
+  "Sales":       { doctype: "Sales Invoice",    mode: "sales" }
+  "Credit Note": { doctype: "Sales Invoice",    mode: "sales", is_return: true }
+  "Purchase":    { doctype: "Purchase Invoice", mode: "purchase" }
+  "Debit Note":  { doctype: "Purchase Invoice", mode: "purchase", is_return: true }
+  "Receipt":     { doctype: "Payment Entry",    mode: "receive" }
+  "Payment":     { doctype: "Payment Entry",    mode: "pay" }
+  "Journal":     { doctype: "Journal Entry",    mode: "journal" }
+  "Contra":      { doctype: "Journal Entry",    mode: "contra" }
+
+# ----------------------------------------------------------------------------
+# Closing-stock (Stock-in-Hand) year-end adjustments.
+# In Tally the auditor keys a closing balance directly onto the "Closing Stock"
+# ledger (under Stock-in-Hand) at each FY end -- no voucher. That single figure
+# shows in BOTH the Balance Sheet (Current Asset) and the P&L ("Less: Closing
+# Stock"), a double-entry Tally generates internally. A GL/voucher migration
+# can't reproduce it, so `load-closing-stock` posts one year-end Journal Entry
+# per FY using gross Opening/Closing lines that mirror Tally's P&L:
+#   Dr Opening Stock (P&L)  <prior close>   Cr Closing Stock (asset) <prior close>
+#   Dr Closing Stock (asset) <this close>   Cr Closing Stock (P&L)   <this close>
+closing_stock:
+  asset_account:   "Closing Stock"        # existing Stock-in-Hand asset ledger (root_type Asset)
+  opening_pl_name: "Opening Stock"        # P&L Expense line for opening stock
+  closing_pl_name: "Closing Stock (P&L)"  # P&L Income line for closing stock
+  # FY-end date (yyyy-mm-dd) -> auditor-keyed closing balance. Each year's opening
+  # stock is the prior row's close; the first year opens at 0.
+  balances: {}
+
+# Close every migrated fiscal year's Income/Expense balances into the same
+# retained-earnings account used for Tally's reserved Profit & Loss A/c.
+period_closing:
+  fiscal_years: []
+
+run:
+  # Safety: every write/delete is a no-op unless --confirm is passed on the CLI.
+  dry_run_default: true
