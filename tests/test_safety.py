@@ -337,6 +337,17 @@ class TallyExtractionTests(unittest.TestCase):
             self.assertEqual(row["source_state"], "missing")
             self.assertEqual(row["erp_name"], "ACC-JV-1")
 
+    def test_reexported_unchanged_voucher_clears_temporary_missing_state(self):
+        payload = {"GUID": "guid-1", "AlterId": "1"}
+        with TemporaryStaging() as store:
+            store.upsert_voucher("guid-1", "Journal", "1", "2024-01-10", None, 100, payload)
+            store.mark("voucher", "guid-1", "loaded", "Journal Entry", "ACC-JV-1")
+            store.clear_voucher_window("2024-01-01", "2024-01-31")
+            store.upsert_voucher("guid-1", "Journal", "1", "2024-01-10", None, 100, payload)
+            row = store.vouchers()[0]
+            self.assertEqual(row["source_state"], "unchanged")
+            self.assertEqual(row["source_present"], 1)
+
     def test_optional_voucher_is_kept_as_inactive_audit_evidence(self):
         vouchers = [self.voucher("20240110", "guid-optional", optional="Yes")]
         with TemporaryStaging() as store:

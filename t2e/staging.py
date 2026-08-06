@@ -193,7 +193,7 @@ class Staging:
             elif existing["source_hash"] != source_hash:
                 state = ("new" if existing["load_status"] in ("pending", "error")
                          and not existing["erp_name"] else "changed")
-            elif existing["source_state"] in ("changed", "missing", "cancelled", "optional"):
+            elif existing["source_state"] in ("changed", "cancelled", "optional"):
                 state = existing["source_state"]
             elif existing["load_status"] in ("pending", "error"):
                 state = "new"
