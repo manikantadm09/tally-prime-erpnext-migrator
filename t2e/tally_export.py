@@ -239,13 +239,35 @@ _VCH_FETCH = [
 ]
 
 
+DEFAULT_LOOKBACK_DAYS = 90
+
+
+def effective_from_date(configured_from: str, checkpoint: str | None,
+                        lookback_days: int) -> str:
+    """Start at the configured floor or a rolling safe lookback window."""
+    if not checkpoint:
+        return configured_from
+    checkpoint_date = dt.datetime.strptime(checkpoint, "%Y%m%d").date()
+    lookback_from = checkpoint_date - dt.timedelta(days=lookback_days)
+    return max(configured_from, lookback_from.strftime("%Y%m%d"))
+
+
 def extract_vouchers(client: TallyClient, store: Staging,
-                     progress=lambda *a: None) -> dict[str, int]:
-    from_d = str(client.from_date) or "20000101"
+                     progress=lambda *a: None,
+                     lookback_days: int | None = None,
+                     full_history: bool = False) -> dict[str, int]:
+    """Extract vouchers, using a checkpointed lookback unless forced full-history."""
+    configured_from = str(client.from_date) or "20000101"
+    if lookback_days is None:
+        from .config import get_config
+        lookback_days = int(
+            get_config().tally.get("checkpoint_lookback_days", DEFAULT_LOOKBACK_DAYS))
+    checkpoint = None if full_history else store.get_checkpoint()
+    from_d = effective_from_date(configured_from, checkpoint, lookback_days)
     to_d = str(client.to_date) or dt.date.today().strftime("%Y%m%d")
     windows = list(_month_windows(from_d, to_d))
     if not windows:
-        return {"_total": 0}
+        return {"_total": 0, "_range_from": from_d, "_range_to": to_d}
     overall_to = windows[-1][1]
     total = 0
     per_type: dict[str, int] = {}
@@ -262,6 +284,9 @@ def extract_vouchers(client: TallyClient, store: Staging,
             total += count
         progress(win_from, authoritative_to, len(vch))
         if suffix_export:
+            overall_to = authoritative_to
             break
     per_type["_total"] = total
+    per_type["_range_from"] = from_d
+    per_type["_range_to"] = overall_to
     return per_type

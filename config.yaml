@@ -11,6 +11,9 @@ tally:
   to_date:   "20241231"             # yyyymmdd; set the approved migration cut-off
   request_timeout: 180             # seconds; large voucher exports can be slow
   page_size: 0                     # 0 = export whole collection in one request
+  # Routine extracts begin this many days behind a clean checkpoint, so recent
+  # Tally edits/cancellations are detected without re-reading all history.
+  checkpoint_lookback_days: 90
 
 erpnext:
   company: "YOUR ERPNext COMPANY"  # isolated ERPNext sandbox target

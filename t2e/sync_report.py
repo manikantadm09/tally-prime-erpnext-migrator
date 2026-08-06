@@ -20,11 +20,17 @@ def build_report(store: Staging) -> dict[str, Any]:
     for row in rows:
         row["source_present"] = bool(row["source_present"])
     states = Counter(row["source_state"] for row in rows)
+    requires_decision = (
+        states.get("changed", 0) + states.get("missing", 0)
+        + states.get("cancelled", 0)
+    )
     return {
         "summary": {
-            "attention_required": len(rows),
+            "new_count": states.get("new", 0),
+            "optional_count": states.get("optional", 0),
+            "requires_decision": requires_decision,
             "by_source_state": dict(sorted(states.items())),
-            "safe_to_load_new": not any(states[k] for k in ("changed", "missing", "cancelled")),
+            "safe_to_load_new": requires_decision == 0,
         },
         "vouchers": rows,
     }
@@ -45,7 +51,8 @@ def write_report(report: dict[str, Any], json_path: str | Path) -> tuple[Path, P
 
 def print_summary(report: dict[str, Any]) -> None:
     summary = report["summary"]
-    print("  source delta:", summary["attention_required"], "record(s) need review")
+    print("  source delta:", summary["new_count"], "new,",
+          summary["requires_decision"], "requiring a decision")
     for state, count in summary["by_source_state"].items():
         print(f"    {state}: {count}")
     if summary["safe_to_load_new"]:

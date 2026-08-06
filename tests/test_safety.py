@@ -22,7 +22,7 @@ from t2e.mapping import CompanyDefaults, Resolved
 from t2e.reconcile import _count_migrated
 from t2e.staging import Staging
 from t2e.sync_report import build_report
-from t2e.tally_export import stage_voucher_export
+from t2e.tally_export import effective_from_date, extract_vouchers, stage_voucher_export
 from t2e.wipe import wipe
 
 
@@ -502,6 +502,42 @@ class PeriodClosingTests(unittest.TestCase):
         self.assertEqual(
             PeriodClosingLoader.dates("2025-2026"),
             ("2025-04-01", "2026-03-31"))
+
+
+class CheckpointTests(unittest.TestCase):
+    def test_no_checkpoint_scans_full_configured_history(self):
+        self.assertEqual(effective_from_date("20220101", None, 90), "20220101")
+
+    def test_checkpoint_rescans_a_lookback_window_behind_it(self):
+        self.assertEqual(effective_from_date("20220101", "20260601", 90), "20260303")
+
+    def test_checkpoint_lookback_never_precedes_configured_floor(self):
+        self.assertEqual(effective_from_date("20220101", "20220115", 90), "20220101")
+
+    def test_checkpoint_round_trips_through_staging(self):
+        with TemporaryStaging() as store:
+            self.assertIsNone(store.get_checkpoint())
+            store.set_checkpoint("20260601")
+            self.assertEqual(store.get_checkpoint(), "20260601")
+            store.set_checkpoint("20260701")
+            self.assertEqual(store.get_checkpoint(), "20260701")
+
+    def test_full_history_flag_ignores_existing_checkpoint(self):
+        class FakeClient:
+            from_date = "20220101"
+            to_date = "20990101"
+
+            def export_collection(self, *a, **kw):
+                return ET.fromstring("<ENVELOPE></ENVELOPE>")
+
+        with TemporaryStaging() as store:
+            store.set_checkpoint("20260601")
+            routine = extract_vouchers(FakeClient(), store, lookback_days=90)
+            self.assertEqual(routine["_range_from"], "20260303")
+            full = extract_vouchers(
+                FakeClient(), store, lookback_days=90, full_history=True)
+            self.assertEqual(full["_range_from"], "20220101")
+            self.assertEqual(store.get_checkpoint(), "20260601")
 
 
 if __name__ == "__main__":

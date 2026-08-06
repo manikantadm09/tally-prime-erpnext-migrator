@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS party_role (
 );
 CREATE INDEX IF NOT EXISTS idx_party_role_name
     ON party_role(ledger_name, party_type);
+
+-- Durable state for incremental extraction.  Its checkpoint is advanced only
+-- after a source delta report has no records requiring an operator decision.
+CREATE TABLE IF NOT EXISTS sync_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 
@@ -313,6 +320,22 @@ class Staging:
                 WHERE source_state NOT IN ('unchanged', 'baseline')
                 ORDER BY vdate,vnumber,guid"""
         ).fetchall()
+
+    # ---- checkpoint --------------------------------------------------------
+    def get_checkpoint(self) -> str | None:
+        """Last extraction boundary (yyyymmdd) confirmed clean by sync-report."""
+        row = self.conn.execute(
+            "SELECT value FROM sync_state WHERE key='last_checkpoint'"
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_checkpoint(self, value: str) -> None:
+        """Record a new confirmed-clean extraction boundary (yyyymmdd)."""
+        self.conn.execute(
+            """INSERT INTO sync_state(key, value) VALUES('last_checkpoint', ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (value,))
+        self.conn.commit()
 
     def duplicate_bill_key_count(self, party: str, billname: str) -> int:
         """How many staged invoice vouchers use this party + bill reference."""

@@ -132,6 +132,15 @@ never overwritten or cancelled automatically: an ERPNext document may have
 allocations or period closing downstream and needs an explicitly approved
 repair workflow.
 
+Routine extracts use a 90-day configurable checkpoint lookback after the first
+clean run. Before production cutover or final sign-off, force a complete source
+sweep so edits or cancellations older than that window are also checked:
+
+```powershell
+python -m t2e extract --full-history
+python -m t2e sync-report
+```
+
 ## Acceptance criteria
 
 Accept a migration only after all of the following are true:

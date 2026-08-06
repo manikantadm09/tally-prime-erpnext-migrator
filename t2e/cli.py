@@ -37,13 +37,29 @@ def cmd_extract(args) -> int:
         if n:
             print(f"  vouchers {f[:6]}: {n}")
     print("Extracting vouchers (month-chunked)...")
-    print("  vouchers:", tx.extract_vouchers(c, s, progress=prog))
+    full_history = getattr(args, "full_history", False)
+    checkpoint = s.get_checkpoint()
+    if full_history:
+        print("  --full-history: ignoring checkpoint, scanning full configured history")
+    elif checkpoint:
+        print(f"  checkpoint: {checkpoint} (re-scanning lookback window forward)")
+    else:
+        print("  no checkpoint yet: scanning full configured history")
+    voucher_counts = tx.extract_vouchers(c, s, progress=prog, full_history=full_history)
+    print("  vouchers:", voucher_counts)
     from .sync_report import build_report, print_summary, write_report
     report = build_report(s)
     print_summary(report)
     json_path, csv_path = write_report(
         report, get_config().staging_db.parent / "reports" / "source_delta.json")
     print(f"  -> delta report: {json_path}, {csv_path}")
+    range_to = voucher_counts.get("_range_to")
+    if range_to and report["summary"]["safe_to_load_new"]:
+        s.set_checkpoint(range_to)
+        print(f"  checkpoint advanced to {range_to}")
+    elif range_to:
+        print(f"  checkpoint NOT advanced: {report['summary']['requires_decision']} "
+              "record(s) need a decision first")
     s.close()
     return 0
 
@@ -372,7 +388,12 @@ def main(argv=None) -> int:
                         "Use as: python -m t2e --env dev <command>")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("extract").set_defaults(func=cmd_extract)
+    ex = sub.add_parser("extract")
+    ex.add_argument(
+        "--full-history", action="store_true",
+        help="ignore the checkpoint and re-scan the full configured history "
+             "(use before sign-off/cutover, not for routine updates)")
+    ex.set_defaults(func=cmd_extract)
 
     sr = sub.add_parser(
         "sync-report",
