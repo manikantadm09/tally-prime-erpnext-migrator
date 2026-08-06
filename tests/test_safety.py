@@ -357,6 +357,14 @@ class TallyExtractionTests(unittest.TestCase):
             self.assertEqual(row["source_state"], "optional")
             self.assertEqual(row["source_present"], 0)
 
+    def test_unloaded_cancelled_source_is_evidence_not_a_repair_blocker(self):
+        vouchers = [self.voucher("20240110", "guid-cancelled", cancelled="Yes")]
+        with TemporaryStaging() as store:
+            stage_voucher_export(store, vouchers, "20240101", "20240131", "20240131")
+            report = build_report(store)
+            self.assertEqual(report["summary"]["requires_decision"], 0)
+            self.assertTrue(report["summary"]["safe_to_load_new"])
+
 
 class BillReferenceTests(unittest.TestCase):
     def test_duplicate_party_bill_references_are_retained(self):

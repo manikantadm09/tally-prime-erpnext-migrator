@@ -20,9 +20,13 @@ def build_report(store: Staging) -> dict[str, Any]:
     for row in rows:
         row["source_present"] = bool(row["source_present"])
     states = Counter(row["source_state"] for row in rows)
-    requires_decision = (
-        states.get("changed", 0) + states.get("missing", 0)
-        + states.get("cancelled", 0)
+    # A source record excluded/cancelled before it ever reached ERPNext has no
+    # target document to repair. It remains audit evidence but does not block.
+    requires_decision = sum(
+        1 for row in rows
+        if row["source_state"] == "changed"
+        or (row["source_state"] in ("missing", "cancelled")
+            and row["erp_doctype"] and row["erp_name"])
     )
     return {
         "summary": {
