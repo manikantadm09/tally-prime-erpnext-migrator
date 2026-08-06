@@ -291,7 +291,9 @@ class MasterLoader:
         return bool(rows and rows[0].get("is_group"))
 
     def _mark(self, guid: str, doctype: str, erp_name: str, status="loaded", err=None):
-        self.store.mark("master", guid, status, doctype, erp_name, err)
+        # Never let a dry-run make staging claim a master exists in ERPNext.
+        if not self.erp.dry_run:
+            self.store.mark("master", guid, status, doctype, erp_name, err)
 
     # ---- Suspense fallback account --------------------------------------
     def ensure_suspense(self) -> None:

@@ -17,6 +17,7 @@ from t2e.load_invoices import (
     _unique_bill_no,
     _unique_transaction_name,
 )
+from t2e.load_masters import MasterLoader
 from t2e.load_period_closing import PeriodClosingLoader
 from t2e.load_vouchers import VoucherLoader
 from t2e.mapping import CompanyDefaults, Resolved
@@ -266,6 +267,17 @@ class ConfigurationTests(unittest.TestCase):
                 side_effect=AssertionError("secret file should be lazy")):
             cfg = Config()
             self.assertEqual(cfg.tally["url"], "http://127.0.0.1:9000")
+
+
+class MasterDryRunTests(unittest.TestCase):
+    def test_dry_run_does_not_mark_master_as_loaded(self):
+        with TemporaryStaging() as store:
+            store.upsert_master("ledger", "master-guid", "New Ledger", None, {})
+            loader = MasterLoader.__new__(MasterLoader)
+            loader.erp = SimpleNamespace(dry_run=True)
+            loader.store = store
+            loader._mark("master-guid", "Account", "New Ledger - TC")
+            self.assertEqual(store.masters("ledger")[0]["load_status"], "pending")
 
 
 class TallyExtractionTests(unittest.TestCase):
