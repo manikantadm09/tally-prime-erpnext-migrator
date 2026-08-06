@@ -64,6 +64,29 @@ def cmd_extract(args) -> int:
     return 0
 
 
+def cmd_approve_change(args) -> int:
+    """Human-approved repair for one changed/missing/cancelled voucher GUID."""
+    from .approve_change import ApprovalError, approve
+    erp, s = ERPNextClient(dry_run=not args.confirm), Staging()
+    _banner(erp.dry_run)
+    if erp.dry_run:
+        print("  (dry-run: shows what would happen; pass --confirm to execute)")
+    try:
+        result = approve(
+            erp, s, args.guid, get_config().idempotency_field,
+            acknowledge_closed_period=args.acknowledge_closed_period)
+        print(f"  GUID {result['guid']}: {result['source_state']} "
+              f"{result['vtype']} {result['vdate']} #{result['vnumber']} "
+              f"({result['erp_doctype']} {result['erp_name']})")
+        print(f"  -> {result['action']}")
+        rc = 0
+    except ApprovalError as exc:
+        print(f"  ! refused: {exc}")
+        rc = 1
+    s.close()
+    return rc
+
+
 def cmd_sync_report(args) -> int:
     """Generate a read-only source change report from the staging database."""
     from .sync_report import build_report, print_summary, write_report
@@ -400,6 +423,18 @@ def main(argv=None) -> int:
         help="read-only delta report: new/changed/missing/cancelled Tally vouchers")
     sr.add_argument("--output", default=None, help="JSON output path (CSV is written beside it)")
     sr.set_defaults(func=cmd_sync_report)
+
+    ac = sub.add_parser(
+        "approve-change",
+        help="human-approved repair for one changed/missing/cancelled voucher "
+             "from sync-report")
+    ac.add_argument("--guid", required=True, help="Tally GUID from sync-report")
+    ac.add_argument("--confirm", action="store_true", help="execute the cancel")
+    ac.add_argument(
+        "--acknowledge-closed-period", action="store_true",
+        help="required to proceed when the voucher's fiscal year already has "
+             "a Period Closing Voucher")
+    ac.set_defaults(func=cmd_approve_change)
 
     for name, func in [("load-masters", cmd_load_masters), ("wipe", cmd_wipe),
                        ("run-all", cmd_run_all)]:

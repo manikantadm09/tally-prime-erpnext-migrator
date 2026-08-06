@@ -132,9 +132,12 @@ class ERPNextClient:
                 return False
             raise
 
-    def find_by_field(self, doctype: str, field: str, value: str) -> str | None:
-        rows = self.get_list(doctype, fields=["name"],
-                             filters=[[field, "=", value]], limit=1)
+    def find_by_field(self, doctype: str, field: str, value: str,
+                      exclude_cancelled: bool = False) -> str | None:
+        filters = [[field, "=", value]]
+        if exclude_cancelled:
+            filters.append(["docstatus", "!=", 2])
+        rows = self.get_list(doctype, fields=["name"], filters=filters, limit=1)
         return rows[0]["name"] if rows else None
 
     def has_field(self, doctype: str, fieldname: str) -> bool:

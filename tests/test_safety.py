@@ -10,6 +10,7 @@ from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
 from t2e.config import Config
+from t2e.approve_change import ApprovalError, approve, preview
 from t2e.load_invoices import (
     InvoiceLoader,
     _supplier_bill_no,
@@ -422,7 +423,7 @@ class IdempotencyTests(unittest.TestCase):
             dry_run = False
             submitted = False
 
-            def find_by_field(self, doctype, field, value):
+            def find_by_field(self, doctype, field, value, exclude_cancelled=False):
                 return "PE-EXISTING" if doctype == "Payment Entry" else None
 
             def submit_doc(self, doctype, doc):
@@ -440,6 +441,31 @@ class IdempotencyTests(unittest.TestCase):
             self.assertFalse(erp.submitted)
             row = store.vouchers()[0]
             self.assertEqual(row["erp_name"], "PE-EXISTING")
+
+    def test_voucher_loader_reloads_when_only_a_cancelled_document_exists(self):
+        class ERP:
+            dry_run = False
+            submitted = False
+
+            def find_by_field(self, doctype, field, value, exclude_cancelled=False):
+                if exclude_cancelled:
+                    return None
+                return "PE-CANCELLED" if doctype == "Payment Entry" else None
+
+            def submit_doc(self, doctype, doc):
+                self.submitted = True
+                return {"data": {"name": "PE-NEW"}}
+
+        with TemporaryStaging() as store:
+            store.upsert_voucher(
+                "guid-3", "Payment", "3", "2026-01-03",
+                "Supplier A", 50.0, json.loads("{}"))
+            erp = ERP()
+            loader = VoucherLoader(erp, store, defaults(), resolver=None)
+            stats = loader.run()
+            self.assertEqual(stats["loaded"], 1)
+            self.assertTrue(erp.submitted)
+            self.assertEqual(store.vouchers()[0]["erp_name"], "PE-NEW")
 
 
 class ScopeSafetyTests(unittest.TestCase):
@@ -519,6 +545,112 @@ class CheckpointTests(unittest.TestCase):
             self.assertIsNone(store.get_checkpoint())
             store.set_checkpoint("20260601")
             self.assertEqual(store.get_checkpoint(), "20260601")
+
+
+class ApproveChangeTests(unittest.TestCase):
+    class FakeERP:
+        def __init__(self, dry_run=True, closed_fy_keys=(), invoice_outstanding=None):
+            self.dry_run = dry_run
+            self.closed_fy_keys = set(closed_fy_keys)
+            self.invoice_outstanding = invoice_outstanding
+            self.cancelled = []
+
+        def cancel(self, doctype, name):
+            if not self.dry_run:
+                self.cancelled.append((doctype, name))
+
+        def find_by_field(self, doctype, field, value, exclude_cancelled=False):
+            if doctype == "Period Closing Voucher":
+                return "PCV-1" if value in self.closed_fy_keys else None
+            return None
+
+        def get_list(self, doctype, fields=None, filters=None, limit=0):
+            if self.invoice_outstanding is None:
+                return []
+            outstanding, total = self.invoice_outstanding
+            return [{"outstanding_amount": outstanding, "grand_total": total}]
+
+    def _stage_changed_je(self, store):
+        store.upsert_voucher(
+            "guid-changed", "Journal", "1", "2024-06-10", None, 100,
+            {"GUID": "guid-changed", "AlterId": "1"})
+        store.mark("voucher", "guid-changed", "loaded", "Journal Entry", "ACC-JV-1")
+        store.clear_voucher_window("2024-06-01", "2024-06-30")
+        store.upsert_voucher(
+            "guid-changed", "Journal", "1", "2024-06-10", None, 120,
+            {"GUID": "guid-changed", "AlterId": "2"})
+        store.conn.commit()
+
+    def test_unknown_guid_is_refused(self):
+        with TemporaryStaging() as store:
+            with self.assertRaisesRegex(ApprovalError, "no staged voucher"):
+                preview(self.FakeERP(), store, "nope", "tally_guid")
+
+    def test_unchanged_voucher_is_refused(self):
+        with TemporaryStaging() as store:
+            store.upsert_voucher("guid-1", "Journal", "1", "2024-01-10", None, 100, {})
+            store.mark("voucher", "guid-1", "loaded", "Journal Entry", "ACC-JV-1")
+            with self.assertRaisesRegex(ApprovalError, "not one of"):
+                preview(self.FakeERP(), store, "guid-1", "tally_guid")
+
+    def test_changed_voucher_dry_run_does_not_mutate_or_cancel(self):
+        with TemporaryStaging() as store:
+            self._stage_changed_je(store)
+            erp = self.FakeERP(dry_run=True)
+            result = approve(erp, store, "guid-changed", "tally_guid")
+            self.assertTrue(result["action"].startswith("dry-run"))
+            self.assertEqual(erp.cancelled, [])
+            row = store.voucher_by_guid("guid-changed")
+            self.assertEqual(row["source_state"], "changed")
+
+    def test_changed_voucher_confirmed_cancels_and_reopens_for_reload(self):
+        with TemporaryStaging() as store:
+            self._stage_changed_je(store)
+            erp = self.FakeERP(dry_run=False)
+            result = approve(erp, store, "guid-changed", "tally_guid")
+            self.assertEqual(erp.cancelled, [("Journal Entry", "ACC-JV-1")])
+            self.assertIn("staged for reload", result["action"])
+            row = store.voucher_by_guid("guid-changed")
+            self.assertEqual(row["source_state"], "new")
+            self.assertEqual(row["load_status"], "pending")
+
+    def test_missing_voucher_confirmed_cancels_and_resolves_without_reload(self):
+        with TemporaryStaging() as store:
+            store.upsert_voucher("guid-gone", "Journal", "1", "2024-01-10", None, 100, {})
+            store.mark("voucher", "guid-gone", "loaded", "Journal Entry", "ACC-JV-2")
+            store.clear_voucher_window("2024-01-01", "2024-01-31")
+            store.conn.commit()
+            erp = self.FakeERP(dry_run=False)
+            result = approve(erp, store, "guid-gone", "tally_guid")
+            self.assertEqual(erp.cancelled, [("Journal Entry", "ACC-JV-2")])
+            self.assertIn("resolved", result["action"])
+            self.assertEqual(store.voucher_by_guid("guid-gone")["source_state"], "resolved")
+            self.assertEqual(store.source_delta_rows(), [])
+
+    def test_invoice_with_payment_allocated_is_blocked(self):
+        with TemporaryStaging() as store:
+            store.upsert_voucher("guid-paid", "Purchase", "1", "2024-06-10", "Supplier A", 100,
+                                 {"GUID": "guid-paid", "AlterId": "1"})
+            store.mark("voucher", "guid-paid", "loaded", "Purchase Invoice", "PINV-1")
+            store.clear_voucher_window("2024-06-01", "2024-06-30")
+            store.upsert_voucher("guid-paid", "Purchase", "1", "2024-06-10", "Supplier A", 120,
+                                 {"GUID": "guid-paid", "AlterId": "2"})
+            store.conn.commit()
+            erp = self.FakeERP(dry_run=False, invoice_outstanding=(30.0, 120.0))
+            with self.assertRaisesRegex(ApprovalError, "payment allocated"):
+                approve(erp, store, "guid-paid", "tally_guid")
+            self.assertEqual(erp.cancelled, [])
+
+    def test_closed_fiscal_year_requires_explicit_acknowledgement(self):
+        with TemporaryStaging() as store:
+            self._stage_changed_je(store)
+            erp = self.FakeERP(dry_run=False, closed_fy_keys={"period-closing-2024-2025"})
+            with self.assertRaisesRegex(ApprovalError, "Period Closing Voucher"):
+                approve(erp, store, "guid-changed", "tally_guid")
+            result = approve(erp, store, "guid-changed", "tally_guid",
+                             acknowledge_closed_period=True)
+            self.assertEqual(erp.cancelled, [("Journal Entry", "ACC-JV-1")])
+            self.assertIn("staged for reload", result["action"])
             store.set_checkpoint("20260701")
             self.assertEqual(store.get_checkpoint(), "20260701")
 

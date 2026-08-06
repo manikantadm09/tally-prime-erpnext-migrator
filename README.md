@@ -132,6 +132,16 @@ never overwritten or cancelled automatically: an ERPNext document may have
 allocations or period closing downstream and needs an explicitly approved
 repair workflow.
 
+For one reviewed GUID, preview the guarded repair first:
+
+```powershell
+python -m t2e approve-change --guid <tally-guid>
+```
+
+Only use `--confirm` after approval. The command refuses invoices with payment
+allocations and requires an explicit closed-period acknowledgement when a
+Period Closing Voucher exists. It never reverses Period Closing Vouchers.
+
 Routine extracts use a 90-day configurable checkpoint lookback after the first
 clean run. Before production cutover or final sign-off, force a complete source
 sweep so edits or cancellations older than that window are also checked:

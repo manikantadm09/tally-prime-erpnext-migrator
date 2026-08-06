@@ -312,7 +312,8 @@ class VoucherLoader:
     def _find_existing(self, guid: str) -> tuple[str, str] | None:
         """Find a prior settlement import regardless of PE/JE fallback path."""
         for doctype in ("Payment Entry", "Journal Entry"):
-            name = self.erp.find_by_field(doctype, self.field, guid)
+            name = self.erp.find_by_field(
+                doctype, self.field, guid, exclude_cancelled=True)
             if name:
                 return doctype, name
         return None

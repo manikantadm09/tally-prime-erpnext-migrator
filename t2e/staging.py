@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS voucher (
     source_hash TEXT,
     source_present INTEGER NOT NULL DEFAULT 1,
     source_state TEXT NOT NULL DEFAULT 'new',
+                                     -- resolved is terminal after an approved cancellation
     erp_doctype TEXT,
     erp_name    TEXT,
     load_status TEXT DEFAULT 'pending',
@@ -317,9 +318,25 @@ class Staging:
             """SELECT guid,vtype,vnumber,vdate,party,amount,alter_id,
                       source_present,source_state,load_status,erp_doctype,erp_name
                  FROM voucher
-                WHERE source_state NOT IN ('unchanged', 'baseline')
+                WHERE source_state NOT IN ('unchanged', 'baseline', 'resolved')
                 ORDER BY vdate,vnumber,guid"""
         ).fetchall()
+
+    def voucher_by_guid(self, guid: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM voucher WHERE guid=?", (guid,)).fetchone()
+
+    def reopen_for_reload(self, guid: str) -> None:
+        """Make a human-approved changed voucher eligible for the normal loader."""
+        self.conn.execute(
+            """UPDATE voucher SET load_status='pending', source_state='new'
+               WHERE guid=?""", (guid,))
+
+    def resolve(self, guid: str) -> None:
+        """Close an approved missing/cancelled source voucher without a replacement."""
+        self.conn.execute(
+            """UPDATE voucher SET load_status='cancelled', source_state='resolved'
+               WHERE guid=?""", (guid,))
 
     # ---- checkpoint --------------------------------------------------------
     def get_checkpoint(self) -> str | None:
