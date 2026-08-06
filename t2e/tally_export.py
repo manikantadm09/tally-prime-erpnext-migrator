@@ -147,14 +147,13 @@ def stage_voucher_export(
     within 31 days of the requested overall end.  The whole suffix is then
     replaced atomically.  A small or ambiguous window leak still fails closed.
     """
-    records: list[tuple[ET.Element, str, str, str, str, str]] = []
+    records: list[tuple[ET.Element, str, str, str, str, str, bool, str | None]] = []
     for idx, v in enumerate(vouchers):
-        if (
-            _text(v, "ISCANCELLED").lower() == "yes"
-            or _text(v, "ISDELETED").lower() == "yes"
-            or _text(v, "ISOPTIONAL").lower() == "yes"
-        ):
-            continue
+        cancelled = (_text(v, "ISCANCELLED").lower() == "yes"
+                     or _text(v, "ISDELETED").lower() == "yes")
+        optional = _text(v, "ISOPTIONAL").lower() == "yes"
+        source_present = not (cancelled or optional)
+        inactive_state = "cancelled" if cancelled else ("optional" if optional else None)
         entries = (
             v.findall("ALLLEDGERENTRIES.LIST")
             + v.findall("LEDGERENTRIES.LIST")
@@ -179,7 +178,8 @@ def stage_voucher_export(
         if not guid:
             guid = f"{vtype}:{vnum}:{raw_date}:{export_from}:{idx}"
         records.append(
-            (v, guid, vtype, vnum, parsed_date, compact_date))
+            (v, guid, vtype, vnum, parsed_date, compact_date,
+             source_present, inactive_state))
 
     authoritative_to = export_to
     suffix_export = False
@@ -201,7 +201,7 @@ def stage_voucher_export(
             and 0 <= (overall_end - latest_date).days <= 31
         )
         if not looks_like_complete_suffix:
-            v, _guid, vtype, vnum, parsed_date, _compact = out_of_window[0]
+            v, _guid, vtype, vnum, parsed_date, _compact, _present, _state = out_of_window[0]
             raise RuntimeError(
                 "Tally returned an out-of-window voucher for "
                 f"{export_from}-{export_to}: date={parsed_date!r}, "
@@ -215,13 +215,15 @@ def stage_voucher_export(
         store.clear_voucher_window(
             _parse_voucher_date(export_from),
             _parse_voucher_date(authoritative_to))
-        for v, guid, vtype, vnum, parsed_date, _compact in records:
+        for v, guid, vtype, vnum, parsed_date, _compact, source_present, inactive_state in records:
             payload = _elem_to_dict(v)
             store.upsert_voucher(
                 guid, vtype, vnum, parsed_date,
                 _text(v, "PARTYLEDGERNAME") or _text(v, "PARTYNAME"),
-                _voucher_total_debit(v), payload)
-            per_type[vtype] = per_type.get(vtype, 0) + 1
+                _voucher_total_debit(v), payload,
+                source_present=source_present, source_state=inactive_state)
+            if source_present:
+                per_type[vtype] = per_type.get(vtype, 0) + 1
     return per_type, suffix_export, authoritative_to
 
 

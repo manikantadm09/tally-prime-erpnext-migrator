@@ -9,12 +9,24 @@ report and retries.
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Iterator
 
 from .config import get_config
+
+
+def _payload_alter_id(payload: dict[str, Any]) -> str | None:
+    value = payload.get("AlterId", payload.get("ALTERID"))
+    return str(value).strip() if value not in (None, "") else None
+
+
+def source_payload_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS master (
@@ -39,6 +51,10 @@ CREATE TABLE IF NOT EXISTS voucher (
     party       TEXT,
     amount      REAL,
     payload     TEXT NOT NULL,         -- full parsed JSON (ledger + inventory entries)
+    alter_id    TEXT,
+    source_hash TEXT,
+    source_present INTEGER NOT NULL DEFAULT 1,
+    source_state TEXT NOT NULL DEFAULT 'new',
     erp_doctype TEXT,
     erp_name    TEXT,
     load_status TEXT DEFAULT 'pending',
@@ -84,6 +100,7 @@ class Staging:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._migrate_bill_ref_schema()
+        self._migrate_voucher_schema()
         self.conn.commit()
 
     def _migrate_bill_ref_schema(self) -> None:
@@ -106,6 +123,29 @@ class Staging:
             """INSERT OR IGNORE INTO bill_ref(party,billname,doctype,invoice)
                SELECT party,billname,doctype,invoice FROM bill_ref_legacy""")
         self.conn.execute("DROP TABLE bill_ref_legacy")
+
+    def _migrate_voucher_schema(self) -> None:
+        """Upgrade old staging databases without resetting target load state."""
+        columns = {r["name"] for r in self.conn.execute(
+            "PRAGMA table_info(voucher)").fetchall()}
+        for name, definition in {
+            "alter_id": "TEXT",
+            "source_hash": "TEXT",
+            "source_present": "INTEGER NOT NULL DEFAULT 1",
+            "source_state": "TEXT NOT NULL DEFAULT 'new'",
+        }.items():
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE voucher ADD COLUMN {name} {definition}")
+        for row in self.conn.execute(
+                "SELECT guid,payload,alter_id,source_hash,source_state FROM voucher"):
+            payload = json.loads(row["payload"])
+            state = row["source_state"] or "baseline"
+            if state == "new" and row["source_hash"] is None:
+                state = "baseline"
+            self.conn.execute(
+                "UPDATE voucher SET alter_id=?,source_hash=?,source_state=? WHERE guid=?",
+                (row["alter_id"] or _payload_alter_id(payload),
+                 row["source_hash"] or source_payload_hash(payload), state, row["guid"]))
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -130,16 +170,43 @@ class Staging:
 
     def upsert_voucher(self, guid: str, vtype: str, vnumber: str | None,
                        vdate: str | None, party: str | None, amount: float,
-                       payload: dict[str, Any]) -> None:
+                       payload: dict[str, Any], *, source_present: bool = True,
+                       source_state: str | None = None) -> None:
+        """Stage source data without automatically reloading changed documents."""
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"))
+        source_hash = source_payload_hash(payload)
+        existing = self.conn.execute(
+            "SELECT source_hash,source_state,load_status,erp_name FROM voucher WHERE guid=?",
+            (guid,)).fetchone()
+        if source_state is None:
+            if existing is None:
+                state = "new"
+            elif existing["source_hash"] != source_hash:
+                state = ("new" if existing["load_status"] in ("pending", "error")
+                         and not existing["erp_name"] else "changed")
+            elif existing["source_state"] in ("changed", "missing", "cancelled", "optional"):
+                state = existing["source_state"]
+            elif existing["load_status"] in ("pending", "error"):
+                state = "new"
+            else:
+                state = "unchanged"
+        else:
+            state = source_state
         self.conn.execute(
-            """INSERT INTO voucher(guid,vtype,vnumber,vdate,party,amount,payload)
-                 VALUES(?,?,?,?,?,?,?)
+            """INSERT INTO voucher(
+                   guid,vtype,vnumber,vdate,party,amount,payload,alter_id,
+                   source_hash,source_present,source_state)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(guid) DO UPDATE SET
                  vtype=excluded.vtype, vnumber=excluded.vnumber,
                  vdate=excluded.vdate, party=excluded.party,
-                 amount=excluded.amount, payload=excluded.payload""",
-            (guid, vtype, vnumber, vdate, party, amount,
-             json.dumps(payload, ensure_ascii=False)),
+                 amount=excluded.amount, payload=excluded.payload,
+                 alter_id=excluded.alter_id, source_hash=excluded.source_hash,
+                 source_present=excluded.source_present,
+                 source_state=excluded.source_state""",
+            (guid, vtype, vnumber, vdate, party, amount, encoded,
+             _payload_alter_id(payload), source_hash, int(source_present), state),
         )
 
     def mark(self, table: str, guid: str, status: str,
@@ -151,6 +218,10 @@ class Staging:
                   erp_name=COALESCE(?,erp_name), error=? WHERE guid=?""",
             (status, erp_doctype, erp_name, error, guid),
         )
+        if table == "voucher" and status in ("loaded", "skipped"):
+            self.conn.execute(
+                "UPDATE voucher SET source_state='unchanged' "
+                "WHERE guid=? AND source_state='new'", (guid,))
 
     # ---- reads -----------------------------------------------------------
     def masters(self, kind: str | None = None,
@@ -165,9 +236,11 @@ class Staging:
         return self.conn.execute(q, args).fetchall()
 
     def vouchers(self, vtype: str | None = None, status: str | None = None,
-                 order_by_date: bool = True) -> list[sqlite3.Row]:
+                 order_by_date: bool = True, *, include_inactive: bool = False) -> list[sqlite3.Row]:
         q = "SELECT * FROM voucher WHERE 1=1"
         args: list[Any] = []
+        if not include_inactive:
+            q += " AND source_present=1"
         if vtype:
             q += " AND vtype=?"; args.append(vtype)
         if status:
@@ -219,15 +292,27 @@ class Staging:
 
     # ---- source replacement ---------------------------------------------
     def clear_voucher_window(self, from_iso: str, to_iso: str) -> int:
-        """Remove a successfully re-exported source window before inserting it.
+        """Mark a re-exported source window absent before staging it.
 
-        This makes source deletions/cancellations/optional-voucher exclusion
-        visible in staging instead of leaving stale rows from a prior extract.
+        Retaining rows exposes a missing/cancelled source voucher instead of
+        silently orphaning its submitted ERPNext document.
         """
         cur = self.conn.execute(
-            "DELETE FROM voucher WHERE vdate BETWEEN ? AND ?",
+            """UPDATE voucher SET source_present=0,
+                   source_state=CASE WHEN source_present=1 THEN 'missing'
+                                     ELSE source_state END
+               WHERE vdate BETWEEN ? AND ?""",
             (from_iso, to_iso))
         return cur.rowcount
+
+    def source_delta_rows(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT guid,vtype,vnumber,vdate,party,amount,alter_id,
+                      source_present,source_state,load_status,erp_doctype,erp_name
+                 FROM voucher
+                WHERE source_state NOT IN ('unchanged', 'baseline')
+                ORDER BY vdate,vnumber,guid"""
+        ).fetchall()
 
     def duplicate_bill_key_count(self, party: str, billname: str) -> int:
         """How many staged invoice vouchers use this party + bill reference."""
@@ -255,8 +340,9 @@ class Staging:
         out: dict[str, dict[str, int]] = {}
         for table, col in (("master", "kind"), ("voucher", "vtype")):
             rows = self.conn.execute(
-                f"SELECT {col} k, load_status s, COUNT(*) c "
-                f"FROM {table} GROUP BY {col}, load_status"
+                f"SELECT {col} k, load_status s, COUNT(*) c FROM {table} "
+                + ("WHERE source_present=1 " if table == "voucher" else "")
+                + f"GROUP BY {col}, load_status"
             ).fetchall()
             for r in rows:
                 out.setdefault(f"{table}:{r['k']}", {})[r["s"]] = r["c"]

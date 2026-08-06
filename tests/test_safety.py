@@ -21,6 +21,7 @@ from t2e.load_vouchers import VoucherLoader
 from t2e.mapping import CompanyDefaults, Resolved
 from t2e.reconcile import _count_migrated
 from t2e.staging import Staging
+from t2e.sync_report import build_report
 from t2e.tally_export import stage_voucher_export
 from t2e.wipe import wipe
 
@@ -306,6 +307,43 @@ class TallyExtractionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ambiguous"):
                 stage_voucher_export(
                     store, vouchers, "20220201", "20220228", "20260727")
+
+    def test_changed_loaded_voucher_is_reported_not_requeued(self):
+        with TemporaryStaging() as store:
+            store.upsert_voucher(
+                "guid-1", "Journal", "1", "2024-01-10", None, 100,
+                {"GUID": "guid-1", "AlterId": "1", "Narration": "before"})
+            store.mark("voucher", "guid-1", "loaded", "Journal Entry", "ACC-JV-1")
+            store.clear_voucher_window("2024-01-01", "2024-01-31")
+            store.upsert_voucher(
+                "guid-1", "Journal", "1", "2024-01-10", None, 120,
+                {"GUID": "guid-1", "AlterId": "2", "Narration": "after"})
+            store.conn.commit()
+            row = store.vouchers()[0]
+            self.assertEqual(row["load_status"], "loaded")
+            self.assertEqual(row["source_state"], "changed")
+            report = build_report(store)
+            self.assertEqual(report["summary"]["by_source_state"], {"changed": 1})
+
+    def test_missing_source_voucher_is_retained_for_review(self):
+        with TemporaryStaging() as store:
+            store.upsert_voucher("guid-1", "Journal", "1", "2024-01-10", None, 100, {})
+            store.mark("voucher", "guid-1", "loaded", "Journal Entry", "ACC-JV-1")
+            store.clear_voucher_window("2024-01-01", "2024-01-31")
+            store.conn.commit()
+            self.assertEqual(store.vouchers(), [])
+            row = store.vouchers(include_inactive=True)[0]
+            self.assertEqual(row["source_state"], "missing")
+            self.assertEqual(row["erp_name"], "ACC-JV-1")
+
+    def test_optional_voucher_is_kept_as_inactive_audit_evidence(self):
+        vouchers = [self.voucher("20240110", "guid-optional", optional="Yes")]
+        with TemporaryStaging() as store:
+            stage_voucher_export(store, vouchers, "20240101", "20240131", "20240131")
+            self.assertEqual(store.vouchers(), [])
+            row = store.vouchers(include_inactive=True)[0]
+            self.assertEqual(row["source_state"], "optional")
+            self.assertEqual(row["source_present"], 0)
 
 
 class BillReferenceTests(unittest.TestCase):

@@ -115,6 +115,23 @@ For a controlled, incremental run, use `load-masters`, `load-invoices`,
 `load-period-closing` individually. Run the default dry-run path first and
 take an ERPNext backup before using `--confirm`.
 
+## Repeat extraction and source changes
+
+For later client updates, first run:
+
+```powershell
+python -m t2e extract
+python -m t2e sync-report
+```
+
+The read-only `sync-report` writes `data/reports/source_delta.json` and CSV
+evidence that classifies vouchers as `new`, `changed`, `missing`, `cancelled`,
+or `optional`. New pending vouchers can continue through the normal dry-run
+then confirmed loader. Changed, missing, and cancelled source vouchers are
+never overwritten or cancelled automatically: an ERPNext document may have
+allocations or period closing downstream and needs an explicitly approved
+repair workflow.
+
 ## Acceptance criteria
 
 Accept a migration only after all of the following are true:

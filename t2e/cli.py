@@ -38,6 +38,26 @@ def cmd_extract(args) -> int:
             print(f"  vouchers {f[:6]}: {n}")
     print("Extracting vouchers (month-chunked)...")
     print("  vouchers:", tx.extract_vouchers(c, s, progress=prog))
+    from .sync_report import build_report, print_summary, write_report
+    report = build_report(s)
+    print_summary(report)
+    json_path, csv_path = write_report(
+        report, get_config().staging_db.parent / "reports" / "source_delta.json")
+    print(f"  -> delta report: {json_path}, {csv_path}")
+    s.close()
+    return 0
+
+
+def cmd_sync_report(args) -> int:
+    """Generate a read-only source change report from the staging database."""
+    from .sync_report import build_report, print_summary, write_report
+    s = Staging()
+    report = build_report(s)
+    print_summary(report)
+    output = args.output or str(
+        get_config().staging_db.parent / "reports" / "source_delta.json")
+    json_path, csv_path = write_report(report, output)
+    print(f"  -> delta report: {json_path}, {csv_path}")
     s.close()
     return 0
 
@@ -353,6 +373,12 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("extract").set_defaults(func=cmd_extract)
+
+    sr = sub.add_parser(
+        "sync-report",
+        help="read-only delta report: new/changed/missing/cancelled Tally vouchers")
+    sr.add_argument("--output", default=None, help="JSON output path (CSV is written beside it)")
+    sr.set_defaults(func=cmd_sync_report)
 
     for name, func in [("load-masters", cmd_load_masters), ("wipe", cmd_wipe),
                        ("run-all", cmd_run_all)]:
