@@ -123,7 +123,8 @@ class OpeningsLoader:
             pass
         key = "opening-balances"
         openings = self._fetch_openings()
-        existing = self.erp.find_by_field("Journal Entry", self.field, key)
+        existing = self.erp.find_by_field(
+            "Journal Entry", self.field, key, exclude_cancelled=True)
         doc, preview = self._build_je(openings, key)
         if existing:
             return {"created": 0, "skipped": 1, "lines": len(openings)}, preview, existing

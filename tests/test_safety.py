@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,10 +15,15 @@ from t2e.approve_change import ApprovalError, approve, preview
 from t2e.load_invoices import (
     InvoiceLoader,
     _supplier_bill_no,
+    _taxes_as_invoice_items,
     _unique_bill_no,
     _unique_transaction_name,
 )
-from t2e.load_masters import MasterLoader
+from t2e.load_masters import (
+    MasterLoader,
+    _insert_with_source_validation_fallback,
+)
+from t2e.ledger_fidelity import account_deltas
 from t2e.load_period_closing import PeriodClosingLoader
 from t2e.load_vouchers import VoucherLoader
 from t2e.mapping import CompanyDefaults, Resolved
@@ -81,8 +87,74 @@ class NamingTests(unittest.TestCase):
             _supplier_bill_no("37991", "guid-aaaaaaaa", duplicate=True),
             "37991")
 
+    def test_cancelled_prompt_name_gets_deterministic_replacement(self):
+        class ERP:
+            @staticmethod
+            def exists(doctype, name):
+                return name == "TLY-SINV-1"
+
+        loader = InvoiceLoader.__new__(InvoiceLoader)
+        loader.erp = ERP()
+        self.assertEqual(
+            loader._available_name("Sales Invoice", "TLY-SINV-1"),
+            "TLY-SINV-1-R1")
+
 
 class InvoiceFidelityTests(unittest.TestCase):
+    def test_ledger_fidelity_delta_reclassifies_without_changing_value(self):
+        desired = {
+            ("IGST INPUT @ 18 % - TC", None, None): Decimal("180.00"),
+            ("Creditors - TC", "Supplier", "Vendor A"): Decimal("-1180.00"),
+            ("Purchases - TC", None, None): Decimal("1000.00"),
+        }
+        actual = {
+            ("Input Tax IGST - TC", None, None): Decimal("180.00"),
+            ("Creditors - TC", "Supplier", "Vendor A"): Decimal("-1180.00"),
+            ("Purchases - TC", None, None): Decimal("1000.00"),
+        }
+        deltas = account_deltas(desired, actual)
+        self.assertEqual(
+            deltas[("IGST INPUT @ 18 % - TC", None, None)],
+            Decimal("180.00"),
+        )
+        self.assertEqual(
+            deltas[("Input Tax IGST - TC", None, None)],
+            Decimal("-180.00"),
+        )
+        self.assertEqual(sum(deltas.values()), Decimal("0.00"))
+
+    def test_server_rewritten_taxes_can_fall_back_to_exact_invoice_items(self):
+        source = {
+            "items": [{
+                "item_code": "Tally Migration Item",
+                "qty": 1,
+                "rate": 100,
+                "expense_account": "Purchases - TC",
+            }],
+            "taxes": [{
+                "account_head": "Input CGST - TC",
+                "description": "CGST INPUT @ 9%",
+                "tax_amount": 9,
+                "cost_center": "Main - TC",
+            }],
+        }
+        exact = _taxes_as_invoice_items(source, "Purchase Invoice")
+        self.assertEqual(source["taxes"][0]["tax_amount"], 9)
+        self.assertEqual(exact["taxes"], [])
+        self.assertEqual(len(exact["items"]), 2)
+        self.assertEqual(exact["items"][1]["rate"], 9)
+        self.assertEqual(
+            exact["items"][1]["expense_account"], "Input CGST - TC")
+
+        india_exact = _taxes_as_invoice_items(
+            source, "Purchase Invoice", suppress_target_gst=True)
+        self.assertTrue(all(
+            item["gst_treatment"] == "Non-GST"
+            and item["gst_hsn_code"] == ""
+            and item["item_tax_rate"] == "{}"
+            for item in india_exact["items"]
+        ))
+
     def test_rounding_narration_gstin_reference_and_due_date(self):
         class ERP:
             dry_run = True
@@ -154,6 +226,7 @@ class InvoiceFidelityTests(unittest.TestCase):
         self.assertEqual(doc["disable_rounded_total"], 0)
         self.assertEqual(doc["due_date"], "2026-08-01")
         self.assertEqual(doc["supplier_gstin"], "29AAAFV8767D1ZR")
+        self.assertEqual(doc["gst_category"], "Registered Regular")
         self.assertEqual(doc["place_of_supply"], "29-Karnataka")
         self.assertEqual(len(doc["taxes"]), 2)
         self.assertEqual([t["rate"] for t in doc["taxes"]], [9.0, 9.0])
@@ -422,7 +495,9 @@ class IdempotencyTests(unittest.TestCase):
             dry_run = False
             inserted = False
 
-            def find_by_field(self, doctype, field, value):
+            def find_by_field(
+                    self, doctype, field, value, exclude_cancelled=False):
+                self.exclude_cancelled = exclude_cancelled
                 return "PI-EXISTING"
 
             def insert_and_submit(self, doctype, doc):
@@ -446,6 +521,7 @@ class IdempotencyTests(unittest.TestCase):
                 stats = loader.run()
             self.assertEqual(stats["skipped"], 1)
             self.assertFalse(erp.inserted)
+            self.assertTrue(erp.exclude_cancelled)
             row = store.vouchers()[0]
             self.assertEqual(row["erp_name"], "PI-EXISTING")
 
@@ -539,6 +615,35 @@ class ScopeSafetyTests(unittest.TestCase):
         for _, filters in erp.filters:
             self.assertIn(["tally_guid", "is", "set"], filters)
 
+    def test_wipe_cancels_submitted_docs_without_deleting_immutable_ledger(self):
+        class ERP:
+            dry_run = False
+
+            def __init__(self):
+                self.cancelled = []
+                self.deleted = []
+
+            @staticmethod
+            def has_field(doctype, fieldname):
+                return True
+
+            @staticmethod
+            def get_list(doctype, fields=None, filters=None, limit=0):
+                if doctype == "Journal Entry":
+                    return [{"name": "JE-1", "docstatus": 1}]
+                return []
+
+            def cancel(self, doctype, name):
+                self.cancelled.append((doctype, name))
+
+            def delete(self, doctype, name):
+                self.deleted.append((doctype, name))
+
+        erp = ERP()
+        wipe(erp, progress=lambda *_: None)
+        self.assertEqual(erp.cancelled, [("Journal Entry", "JE-1")])
+        self.assertEqual(erp.deleted, [])
+
     def test_reconciliation_count_is_company_scoped(self):
         class ERP:
             def get_list(self, doctype, fields=None, filters=None, limit=0):
@@ -559,6 +664,39 @@ class PeriodClosingTests(unittest.TestCase):
         self.assertEqual(
             PeriodClosingLoader.dates("2025-2026"),
             ("2025-04-01", "2026-03-31"))
+
+
+class SourceMasterValidationTests(unittest.TestCase):
+    class RejectOnceERP:
+        def __init__(self, message):
+            self.message = message
+            self.docs = []
+
+        def insert(self, doctype, doc):
+            self.docs.append((doctype, dict(doc)))
+            if len(self.docs) == 1:
+                from t2e.erpnext_client import ERPNextError
+                raise ERPNextError("validation failed", 417, self.message)
+            return {"data": {"name": "created"}}
+
+    def test_invalid_gstin_is_omitted_without_guessing_replacement(self):
+        erp = self.RejectOnceERP("Invalid GSTIN! check digit validation failed")
+        _insert_with_source_validation_fallback(erp, "Supplier", {
+            "supplier_name": "Supplier A", "gstin": "BAD", "tax_id": "BAD",
+        })
+        self.assertEqual(len(erp.docs), 2)
+        self.assertNotIn("gstin", erp.docs[1][1])
+        self.assertNotIn("tax_id", erp.docs[1][1])
+
+    def test_invalid_postal_code_is_omitted_but_address_is_preserved(self):
+        erp = self.RejectOnceERP("Postal Code is not associated with Karnataka")
+        _insert_with_source_validation_fallback(erp, "Address", {
+            "address_title": "Supplier A", "state": "Karnataka",
+            "address_line1": "Original address", "pincode": "500003",
+        })
+        self.assertEqual(len(erp.docs), 2)
+        self.assertNotIn("pincode", erp.docs[1][1])
+        self.assertEqual(erp.docs[1][1]["address_line1"], "Original address")
 
 
 class CheckpointTests(unittest.TestCase):

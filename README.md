@@ -111,9 +111,23 @@ python -m t2e bs-check --from-date 20240401 --to-date 20250331
 ```
 
 For a controlled, incremental run, use `load-masters`, `load-invoices`,
-`load-vouchers`, `load-openings`, `load-closing-stock`, and
-`load-period-closing` individually. Run the default dry-run path first and
-take an ERPNext backup before using `--confirm`.
+`load-vouchers`, `load-openings`, `load-closing-stock`,
+`load-ledger-fidelity`, and `load-period-closing` individually, in that order.
+`load-ledger-fidelity` compares each invoice's submitted GL with the exact
+source ledger vector and creates only balanced, same-date reclassifications for
+accounts substituted by ERPNext/India Compliance. It must run before period
+closing. Run the default dry-run path first and take an ERPNext backup before
+using `--confirm`.
+
+Payment allocation is intentionally not applied by `run-all`. Review it as a
+separate operation because it uses FIFO within each party and can change many
+invoice/payment references without changing the GL:
+
+```powershell
+python -m t2e reconcile-payments
+# Inspect data/reports/payment_reconciliation.{json,csv} and obtain approval.
+python -m t2e reconcile-payments --confirm
+```
 
 ## Repeat extraction and source changes
 

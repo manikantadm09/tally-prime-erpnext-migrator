@@ -36,7 +36,8 @@ class PeriodClosingLoader:
             start, end = self.dates(fiscal_year)
             key = f"period-closing-{fiscal_year}"
             existing = self.erp.find_by_field(
-                "Period Closing Voucher", self.field, key)
+                "Period Closing Voucher", self.field, key,
+                exclude_cancelled=True)
             if existing:
                 stats["skipped"] += 1
                 results.append((fiscal_year, "skipped", existing))

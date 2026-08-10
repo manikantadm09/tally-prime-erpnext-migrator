@@ -47,17 +47,46 @@ def _delete_all(erp: ERPNextClient, doctype: str, company: str | None,
         filters.append([field, "is", "set"])
     rows = erp.get_list(doctype, fields=["name", "docstatus"],
                         filters=filters or None, limit=0)
+    # Close later accounting periods before earlier ones.  The same newest-
+    # first order is also safest for references among ordinary transactions.
+    rows.sort(key=lambda row: str(row.get("name") or ""), reverse=True)
     n = 0
     for r in rows:
         name = r["name"]
         try:
-            if r.get("docstatus") == 1:
+            status = int(r.get("docstatus") or 0)
+            if status == 1:
                 erp.cancel(doctype, name)
-            erp.delete(doctype, name)
+                # ERPNext's immutable ledger deliberately retains cancelled
+                # GL/Payment Ledger rows. Deleting the cancelled parent is
+                # rejected and is unnecessary: docstatus=2 has no live impact.
+            elif status == 0:
+                erp.delete(doctype, name)
+            # status=2 is already safely inactive.
             n += 1
         except ERPNextError as exc:
             progress(f"  ! {doctype} {name}: {str(exc)[:120]}")
     return n
+
+
+def active_migrated_counts(erp: ERPNextClient) -> dict[str, int]:
+    """Active/draft tagged transactions remaining after a scoped wipe."""
+    cfg = get_config()
+    company = cfg.erpnext["company"]
+    field = cfg.idempotency_field
+    counts: dict[str, int] = {}
+    for dt in TXN_DOCTYPES:
+        if not erp.has_field(dt, field):
+            counts[dt] = 0
+            continue
+        rows = erp.get_list(
+            dt, fields=["name"], filters=[
+                ["company", "=", company],
+                [field, "is", "set"],
+                ["docstatus", "!=", 2],
+            ], limit=0)
+        counts[dt] = len(rows)
+    return counts
 
 
 def wipe(erp: ERPNextClient, with_masters: bool = False,

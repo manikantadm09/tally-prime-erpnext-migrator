@@ -18,6 +18,7 @@ loader instead -- nothing is dropped.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
 import re
@@ -196,6 +197,12 @@ class InvoiceLoader:
             get_config().erpnext.get("company_gstin", ""))
         if self._supports(doctype, "place_of_supply") and place:
             doc["place_of_supply"] = place
+        # India Compliance rejects the contradictory combination of a GSTIN
+        # with its default "Unregistered" category.  Tally's voucher-level
+        # GSTIN is the authoritative evidence that this transaction is
+        # registered, even when an inherited ERPNext party master is stale.
+        if (party_gstin and self._supports(doctype, "gst_category")):
+            doc["gst_category"] = "Registered Regular"
         if self._supports(doctype, "company_gstin") and company_gstin:
             doc["company_gstin"] = company_gstin
         if self._supports(doctype, "tally_voucher_number"):
@@ -207,8 +214,9 @@ class InvoiceLoader:
             # This site sets Sales Invoice autoname to "Prompt". Tally voucher
             # numbers can repeat across years, so append date + GUID to make the
             # ERPNext name deterministic and globally unique.
-            doc["name"] = _unique_transaction_name(
+            base_name = _unique_transaction_name(
                 vrow["vnumber"], vrow["vdate"], vrow["guid"], "TLY-SINV")
+            doc["name"] = self._available_name(doctype, base_name)
             if self._supports(doctype, "billing_address_gstin") and party_gstin:
                 doc["billing_address_gstin"] = party_gstin
         else:
@@ -245,6 +253,18 @@ class InvoiceLoader:
         except (AttributeError, ERPNextError):
             return False
 
+    def _available_name(self, doctype: str, base_name: str) -> str:
+        """Return a deterministic replacement name when an immutable cancelled
+        document already owns the normal prompt-based Sales Invoice name."""
+        if not self.erp.exists(doctype, base_name):
+            return base_name
+        for number in range(1, 1000):
+            candidate = f"{base_name}-R{number}"
+            if not self.erp.exists(doctype, candidate):
+                return candidate
+        raise ERPNextError(
+            f"No replacement name available for {doctype} {base_name}")
+
     # ---- run ------------------------------------------------------------
     def run(self, vtype=None, limit=0, progress=lambda *a: None) -> dict[str, int]:
         types = [vtype] if vtype else list(INVOICE_SPECS)
@@ -269,7 +289,8 @@ class InvoiceLoader:
                 doc, party, doctype, billname, bridge = built
                 manual_rounding = doc.pop("_tally_manual_rounding", None)
                 existing = self.erp.find_by_field(
-                    doctype, self.field, vrow["guid"])
+                    doctype, self.field, vrow["guid"],
+                    exclude_cancelled=True)
                 if existing:
                     if not self._is_submitted(doctype, existing):
                         # A prior submit failure can leave a tagged draft. It has
@@ -300,10 +321,52 @@ class InvoiceLoader:
                 name = _name_of(res)
                 if not name:
                     name = self.erp.find_by_field(
-                        doctype, self.field, vrow["guid"])
+                        doctype, self.field, vrow["guid"],
+                        exclude_cancelled=True)
                 if not name:
                     raise ERPNextError(
                         f"{doctype} submitted but no document name returned")
+                if not self._posted_value_matches(
+                        doctype, name, float(vrow["amount"] or 0)):
+                    # A target hook can silently remove an Actual tax row for an
+                    # unregistered party, or replace its rate from the generic
+                    # item's HSN.  A successful submit is therefore not proof
+                    # that the source value survived.  Cancel the altered
+                    # document and retry with the exact tax ledger amounts as
+                    # explicit invoice lines, without guessing new tax data.
+                    self.erp.cancel(doctype, name)
+                    item_doctype = (
+                        "Sales Invoice Item" if doctype == "Sales Invoice"
+                        else "Purchase Invoice Item"
+                    )
+                    exact_doc = _taxes_as_invoice_items(
+                        doc,
+                        doctype,
+                        suppress_target_gst=self._supports(
+                            item_doctype, "gst_treatment"),
+                    )
+                    if doctype == "Sales Invoice" and exact_doc.get("name"):
+                        exact_doc["name"] = self._available_name(
+                            doctype, exact_doc["name"])
+                    try:
+                        res = self._insert_and_submit(
+                            doctype, exact_doc, manual_rounding)
+                    except ERPNextError:
+                        self.fallback.append(vrow["guid"])
+                        stats["fallback"] += 1
+                        continue
+                    name = _name_of(res)
+                    if not name:
+                        name = self.erp.find_by_field(
+                            doctype, self.field, vrow["guid"],
+                            exclude_cancelled=True)
+                    if not name or not self._posted_value_matches(
+                            doctype, name, float(vrow["amount"] or 0)):
+                        if name:
+                            self.erp.cancel(doctype, name)
+                        self.fallback.append(vrow["guid"])
+                        stats["fallback"] += 1
+                        continue
                 if bridge:
                     created = self._ensure_party_bridge(
                         vrow, bridge, doctype, name)
@@ -318,7 +381,8 @@ class InvoiceLoader:
                 existing = None
                 if not self.erp.dry_run and doctype:
                     existing = self.erp.find_by_field(
-                        doctype, self.field, vrow["guid"])
+                        doctype, self.field, vrow["guid"],
+                        exclude_cancelled=True)
                 if (
                     existing
                     and self._is_submitted(doctype, existing)
@@ -340,6 +404,28 @@ class InvoiceLoader:
         self.store.conn.commit()
         progress(len(rows), len(rows), stats)
         return stats
+
+    def _posted_value_matches(
+            self, doctype: str, name: str, source_total: float) -> bool:
+        """Fail closed when server-side hooks change a submitted invoice."""
+        rows = self.erp.get_list(
+            "GL Entry",
+            fields=["debit", "credit"],
+            filters=[
+                ["voucher_type", "=", doctype],
+                ["voucher_no", "=", name],
+                ["is_cancelled", "=", 0],
+            ],
+            limit=0,
+        )
+        debit = round(sum(float(row.get("debit") or 0) for row in rows), 2)
+        credit = round(sum(float(row.get("credit") or 0) for row in rows), 2)
+        expected = round(abs(float(source_total or 0)), 2)
+        return (
+            bool(rows)
+            and abs(debit - credit) < 0.004
+            and abs(debit - expected) < 0.004
+        )
 
     def _is_submitted(self, doctype: str, name: str) -> bool:
         # Lightweight mocks used in unit tests do not expose the raw request
@@ -407,7 +493,8 @@ class InvoiceLoader:
         party control and references the invoice, leaving the final GL identical.
         """
         key = f"{vrow['guid']}:party-control-bridge"
-        existing = self.erp.find_by_field("Journal Entry", self.field, key)
+        existing = self.erp.find_by_field(
+            "Journal Entry", self.field, key, exclude_cancelled=True)
         if existing:
             return False
         party_line = bridge["party_line"]
@@ -452,6 +539,50 @@ class InvoiceLoader:
 
 def _norm(value) -> str:
     return " ".join(_scalar(value).split())
+
+
+def _taxes_as_invoice_items(
+        doc: dict, doctype: str, *, suppress_target_gst: bool = False) -> dict:
+    """Preserve exact tax-ledger postings when target tax hooks rewrite rows.
+
+    The normal path continues to use ERPNext's Taxes table. This representation
+    is used only after submitted GL proves that the target changed the source
+    amount. Tax ledgers remain visible on the invoice and post to their mapped
+    accounts without inferring or fabricating a tax rate.
+    """
+    exact = deepcopy(doc)
+    account_field = (
+        "income_account" if doctype == "Sales Invoice" else "expense_account"
+    )
+    for tax in exact.get("taxes") or []:
+        amount = round(float(tax.get("tax_amount") or 0), 2)
+        if not amount:
+            continue
+        label = str(
+            tax.get("description") or tax.get("account_head") or "Tax"
+        )
+        exact.setdefault("items", []).append({
+            "item_code": GENERIC_ITEM,
+            "item_name": label[:140],
+            "description": label[:1000],
+            "qty": 1 if amount > 0 else -1,
+            "rate": abs(amount),
+            account_field: tax["account_head"],
+            "cost_center": tax.get("cost_center"),
+        })
+    exact["taxes"] = []
+    exact.pop("taxes_and_charges", None)
+    if suppress_target_gst:
+        # India Compliance can recalculate tax from the migration item's HSN at
+        # submit time even after explicit taxes are removed.  Mark only this
+        # exact-ledger fallback representation Non-GST so it does not fabricate
+        # a second tax.  The source tax ledgers remain explicit invoice lines.
+        for item in exact.get("items") or []:
+            item["gst_treatment"] = "Non-GST"
+            item["gst_hsn_code"] = ""
+            item["item_tax_template"] = ""
+            item["item_tax_rate"] = "{}"
+    return exact
 
 
 def _bankers_round_to_rupee(value: float) -> float:

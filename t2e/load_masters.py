@@ -13,6 +13,45 @@ from .lines import is_round_ledger
 from .mapping import CompanyDefaults, GroupTree, acc_name
 from .staging import Staging
 
+
+def _insert_with_source_validation_fallback(
+        erp: ERPNextClient, doctype: str, doc: dict):
+    """Retry a source master after removing only fields ERPNext proves invalid.
+
+    Tally remains the audit source because its complete payload stays in
+    staging.  This fallback never guesses a corrected PIN or GSTIN.
+    """
+    candidate = dict(doc)
+    removed: list[str] = []
+    for _ in range(3):
+        try:
+            result = erp.insert(doctype, candidate)
+            if removed:
+                label = (candidate.get("customer_name")
+                         or candidate.get("supplier_name")
+                         or candidate.get("address_title") or "source master")
+                print(f"  ! {label}: omitted invalid source field(s): "
+                      f"{', '.join(removed)}")
+            return result
+        except ERPNextError as exc:
+            detail = f"{exc} {getattr(exc, 'body', '') or ''}".lower()
+            drop: list[str] = []
+            if "invalid gstin" in detail or "check digit validation" in detail:
+                drop.extend(
+                    ("gstin", "gst_category") if doctype == "Address"
+                    else ("gstin", "tax_id"))
+            if doctype == "Address" and "postal code" in detail:
+                drop.append("pincode")
+            drop = [field for field in drop if field in candidate]
+            if not drop:
+                raise
+            for field in drop:
+                candidate.pop(field, None)
+                if field not in removed:
+                    removed.append(field)
+    raise ERPNextError(
+        f"Could not insert {doctype} after source validation fallback")
+
 IDEMPOTENT_DOCTYPES = [
     "Account", "Customer", "Supplier", "Item", "Cost Center",
     "Journal Entry", "Payment Entry", "Sales Invoice", "Purchase Invoice",
@@ -511,7 +550,8 @@ class MasterLoader:
                             if self.erp.has_field("Customer", "tax_id"):
                                 doc["tax_id"] = (
                                     payload.get("PARTYGSTIN", "") or "")
-                            self.erp.insert("Customer", doc)
+                            _insert_with_source_validation_fallback(
+                                self.erp, "Customer", doc)
                         nc += 1
                     else:
                         if not self.erp.find_by_field(
@@ -529,7 +569,8 @@ class MasterLoader:
                             if self.erp.has_field("Supplier", "tax_id"):
                                 doc["tax_id"] = (
                                     payload.get("PARTYGSTIN", "") or "")
-                            self.erp.insert("Supplier", doc)
+                            _insert_with_source_validation_fallback(
+                                self.erp, "Supplier", doc)
                         ns += 1
                     self.store.add_party_role(
                         r["guid"], name, kind, name)
@@ -595,7 +636,8 @@ class MasterLoader:
                     doc["gstin"] = gstin
                 if gstin and self.erp.has_field("Address", "gst_category"):
                     doc["gst_category"] = "Registered Regular"
-                self.erp.insert("Address", doc)
+                _insert_with_source_validation_fallback(
+                    self.erp, "Address", doc)
 
         if any((contact, phone, email)):
             existing = self.erp.find_by_field(

@@ -100,7 +100,8 @@ class ClosingStockLoader:
         prev = 0.0
         for date, closing in balances:
             key = f"closing-stock-{date}"
-            existing = self.erp.find_by_field("Journal Entry", self.field, key)
+            existing = self.erp.find_by_field(
+                "Journal Entry", self.field, key, exclude_cancelled=True)
             if existing:
                 stats["skipped"] += 1
                 results.append((date, prev, closing, "skipped", existing))

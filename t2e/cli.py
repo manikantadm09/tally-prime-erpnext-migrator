@@ -174,6 +174,27 @@ def cmd_load_vouchers(args) -> int:
     return 0
 
 
+def cmd_load_ledger_fidelity(args) -> int:
+    """Reclassify target-substituted invoice GL back to exact Tally ledgers."""
+    from .ledger_fidelity import LedgerFidelityLoader
+    from .load_masters import fetch_company_defaults
+    from .mapping import LedgerResolver
+    erp, s = ERPNextClient(dry_run=not args.confirm), Staging()
+    _banner(erp.dry_run)
+    defaults = fetch_company_defaults(erp)
+    loader = LedgerFidelityLoader(
+        erp, s, defaults, LedgerResolver(s, defaults))
+
+    def prog(i, total, stats):
+        print(f"  {i}/{total} created={stats['created']} error={stats['error']}")
+    stats = loader.run(progress=prog)
+    print("  ledger fidelity:", stats)
+    if erp.dry_run and stats["planned"]:
+        print("  -> run before load-period-closing; review, then pass --confirm")
+    s.close()
+    return 1 if stats["error"] else 0
+
+
 def _reset_staging_after_wipe(with_masters: bool) -> None:
     """Wiped ERPNext docs no longer exist, so mark their staged source rows
     pending again -- otherwise the loader would skip them on reload."""
@@ -188,14 +209,20 @@ def _reset_staging_after_wipe(with_masters: bool) -> None:
 
 
 def cmd_wipe(args) -> int:
-    from .wipe import wipe
+    from .wipe import active_migrated_counts, wipe
     erp = ERPNextClient(dry_run=not args.confirm)
     _banner(erp.dry_run)
     if erp.dry_run:
         print("  (dry-run: would cancel+delete transactions; pass --confirm to execute)")
     print("  wiped:", wipe(erp, with_masters=args.with_masters))
     if not erp.dry_run:
+        remaining = active_migrated_counts(erp)
+        if any(remaining.values()):
+            print("  ! staging NOT reset; active tagged documents remain:",
+                  remaining)
+            return 1
         _reset_staging_after_wipe(args.with_masters)
+        print("  active tagged documents remaining: 0; staging reset")
     return 0
 
 
@@ -326,6 +353,7 @@ def cmd_bs_check(args) -> int:
 def cmd_run_all(args) -> int:
     from .load_closing_stock import ClosingStockLoader
     from .load_invoices import InvoiceLoader, ensure_generic_item
+    from .ledger_fidelity import LedgerFidelityLoader
     from .load_masters import ensure_fiscal_years
     from .load_openings import OpeningsLoader
     from .load_period_closing import PeriodClosingLoader
@@ -387,19 +415,21 @@ def cmd_run_all(args) -> int:
         print(" ", row)
     print("  closing-stock:", closing_stats)
 
-    print("\n[7/9] Close fiscal-year P&L to retained earnings")
+    print("\n[7/9] Reclass target-substituted invoice accounts to Tally ledgers")
+    fidelity_stats = LedgerFidelityLoader(
+        erp, s, defaults, LedgerResolver(s, defaults)).run()
+    print("  ledger fidelity:", fidelity_stats)
+
+    print("\n[8/9] Close fiscal-year P&L to retained earnings")
     pc_stats, pc_results = PeriodClosingLoader(erp, defaults).run()
     for row in pc_results:
         print(" ", row)
     print("  period-closing:", pc_stats)
 
-    print("\n[8/9] Reconcile payment advances against invoices")
-    from .reconcile_payments import PaymentReconciler
-    payment_stats = PaymentReconciler(erp, defaults).run()
-    print("  payment reconciliation:", payment_stats)
-
     print("\n[9/9] Reconcile")
     print_summary(build_report(erp, s))
+    print("  payment reconciliation was not auto-applied; run the explicit "
+          "reconcile-payments dry run and review its report before --confirm")
     s.close()
     return 0
 
@@ -469,6 +499,13 @@ def main(argv=None) -> int:
     rp.add_argument("--party", default=None, help="only this customer/supplier")
     rp.add_argument("--limit", type=int, default=0, help="max parties to process")
     rp.set_defaults(func=cmd_reconcile_payments)
+
+    lf = sub.add_parser(
+        "load-ledger-fidelity",
+        help="reclass ERPNext/India Compliance substituted invoice accounts "
+             "back to exact mapped Tally ledgers")
+    lf.add_argument("--confirm", action="store_true", help="execute writes")
+    lf.set_defaults(func=cmd_load_ledger_fidelity)
 
     cs = sub.add_parser("load-closing-stock",
                         help="post year-end closing-stock adjustment Journal Entries")
