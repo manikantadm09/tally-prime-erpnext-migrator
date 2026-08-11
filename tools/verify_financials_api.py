@@ -17,6 +17,7 @@ from xml.etree import ElementTree as ET
 
 from t2e.config import get_config
 from t2e.erpnext_client import ERPNextClient
+from t2e.lines import is_round_ledger
 from t2e.load_masters import fetch_company_defaults
 from t2e.mapping import GroupTree, acc_name
 from t2e.staging import Staging
@@ -107,12 +108,14 @@ def fetch_erp_data(erp: ERPNextClient, company: str) -> dict[str, Any]:
             "root_type",
             "account_type",
             "is_group",
+            "tally_guid",
         ],
         filters=[["company", "=", company]],
         limit=0,
     )
     documents: dict[str, list[dict]] = {}
     document_by_name: dict[str, dict] = {}
+    document_by_guid: dict[str, dict] = {}
     for doctype in DOCTYPE_NAMES:
         rows = erp.get_list(
             doctype,
@@ -126,10 +129,19 @@ def fetch_erp_data(erp: ERPNextClient, company: str) -> dict[str, Any]:
         )
         documents[doctype] = rows
         for row in rows:
-            document_by_name[row["name"]] = {
+            document = {
                 **row,
                 "doctype": doctype,
             }
+            document_by_name[row["name"]] = document
+            guid = str(row.get("tally_guid") or "")
+            if guid:
+                if guid in document_by_guid:
+                    raise RuntimeError(
+                        f"multiple active ERPNext documents carry "
+                        f"tally_guid={guid!r}"
+                    )
+                document_by_guid[guid] = document
     gl = erp.get_list(
         "GL Entry",
         fields=[
@@ -156,6 +168,7 @@ def fetch_erp_data(erp: ERPNextClient, company: str) -> dict[str, Any]:
         "accounts": accounts,
         "documents": documents,
         "document_by_name": document_by_name,
+        "document_by_guid": document_by_guid,
         "gl": migrated_gl,
     }
 
@@ -194,11 +207,43 @@ def source_postings(
         norm(account_name).lower(): account_name
         for account_name in account_meta
     }
+    live_by_guid = {
+        str(meta.get("tally_guid")): account_name
+        for account_name, meta in account_meta.items()
+        if meta.get("tally_guid") and not int(meta.get("is_group") or 0)
+    }
+    live_by_account_name: dict[str, list[str]] = defaultdict(list)
+    for account_name, meta in account_meta.items():
+        if not int(meta.get("is_group") or 0):
+            live_by_account_name[norm(meta.get("account_name")).lower()].append(
+                account_name
+            )
 
     def canonical(account_name: str) -> str:
         return canonical_accounts.get(
             norm(account_name).lower(), account_name
         )
+
+    retained_earnings = canonical(
+        acc_name(
+            get_config().erpnext["retained_earnings_account"], defaults.abbr
+        )
+    )
+
+    def live_account(master) -> str:
+        """Resolve staged ledgers against the current target company."""
+        source_name = norm(master["name"])
+        if source_name.lower() == "profit & loss a/c":
+            return retained_earnings
+        if is_round_ledger(source_name):
+            return canonical(defaults.round_off)
+        by_guid = live_by_guid.get(str(master["guid"]))
+        if by_guid:
+            return by_guid
+        candidates = live_by_account_name.get(source_name.lower(), [])
+        if len(candidates) == 1:
+            return candidates[0]
+        return canonical(master["erp_name"] or source_name)
 
     mapping = {}
     for master in store.masters("ledger"):
@@ -212,7 +257,7 @@ def source_postings(
                 else defaults.payable
             )
         else:
-            account = canonical(master["erp_name"])
+            account = live_account(master)
             key = ("account", account)
         mapping[norm(master["name"]).lower()] = (key, account)
 
@@ -533,7 +578,9 @@ def balance_sheet_from_postings(
 
 
 def voucher_verification(
-    store: Staging, gl: list[dict[str, Any]]
+    store: Staging,
+    gl: list[dict[str, Any]],
+    document_by_guid: dict[str, dict],
 ) -> tuple[dict, list[dict]]:
     by_voucher: dict[str, dict[str, Decimal | int]] = defaultdict(
         lambda: {
@@ -549,15 +596,19 @@ def voucher_verification(
         bucket["credit"] += money(entry.get("credit"))
 
     differences = []
+    tolerance_exceptions = []
     missing = 0
     unbalanced = 0
     exact = 0
+    within_tolerance = 0
     source_total = Decimal("0.00")
     target_total = Decimal("0.00")
     for row in store.vouchers():
         source = money(row["amount"])
         source_total += source
-        bucket = by_voucher.get(row["erp_name"])
+        live_document = document_by_guid.get(str(row["guid"]))
+        live_name = live_document["name"] if live_document else ""
+        bucket = by_voucher.get(live_name)
         if not bucket:
             missing += 1
             differences.append(
@@ -566,7 +617,7 @@ def voucher_verification(
                     "type": row["vtype"],
                     "number": row["vnumber"],
                     "date": row["vdate"],
-                    "erp_document": row["erp_name"],
+                    "erp_document": live_name,
                     "source_debit": f"{source:.2f}",
                     "target_debit": "0.00",
                     "target_credit": "0.00",
@@ -581,8 +632,21 @@ def voucher_verification(
         if abs(debit - credit) > TOLERANCE:
             unbalanced += 1
         difference = debit - source
-        if abs(difference) <= TOLERANCE:
+        if difference == 0:
             exact += 1
+        if abs(difference) <= TOLERANCE:
+            within_tolerance += 1
+            if difference:
+                tolerance_exceptions.append({
+                    "guid": row["guid"],
+                    "type": row["vtype"],
+                    "number": row["vnumber"],
+                    "date": row["vdate"],
+                    "erp_document": live_name,
+                    "source_debit": f"{source:.2f}",
+                    "target_debit": f"{debit:.2f}",
+                    "difference": f"{difference:.2f}",
+                })
         else:
             differences.append(
                 {
@@ -590,7 +654,7 @@ def voucher_verification(
                     "type": row["vtype"],
                     "number": row["vnumber"],
                     "date": row["vdate"],
-                    "erp_document": row["erp_name"],
+                    "erp_document": live_name,
                     "source_debit": f"{source:.2f}",
                     "target_debit": f"{debit:.2f}",
                     "target_credit": f"{credit:.2f}",
@@ -601,6 +665,10 @@ def voucher_verification(
     summary = {
         "source_vouchers": len(store.vouchers()),
         "exact_amount_matches": exact,
+        "within_paise_tolerance_matches": within_tolerance,
+        "paise_tolerance": f"{TOLERANCE:.2f}",
+        "tolerance_exception_count": len(tolerance_exceptions),
+        "tolerance_exceptions": tolerance_exceptions,
         "differences": len(differences),
         "missing_target_gl": missing,
         "unbalanced_target_vouchers": unbalanced,
@@ -828,7 +896,7 @@ def main() -> None:
 
     print("Comparing every source voucher with its target GL value ...")
     voucher_summary, voucher_differences = voucher_verification(
-        store, erp_data["gl"]
+        store, erp_data["gl"], erp_data["document_by_guid"]
     )
     print("Reconstructing Tally ledger postings from captured source XML ...")
     postings = source_postings(
@@ -909,7 +977,7 @@ def main() -> None:
         for doctype, rows in erp_data["documents"].items()
     }
     checks = {
-        "all_source_vouchers_have_exact_target_gl_value": (
+        "all_source_vouchers_are_within_paise_tolerance": (
             voucher_summary["differences"] == 0
             and voucher_summary["missing_target_gl"] == 0
             and voucher_summary["unbalanced_target_vouchers"] == 0
@@ -990,6 +1058,10 @@ def main() -> None:
         f"- Latest source voucher: {latest.isoformat()}",
         f"- Source vouchers checked: {voucher_summary['source_vouchers']}",
         f"- Exact voucher-value matches: {voucher_summary['exact_amount_matches']}",
+        f"- Matches within INR {voucher_summary['paise_tolerance']} tolerance: "
+        f"{voucher_summary['within_paise_tolerance_matches']}",
+        f"- Non-zero paise-tolerance exceptions: "
+        f"{voucher_summary['tolerance_exception_count']}",
         f"- Source/target voucher debit total: INR {voucher_summary['source_total_debit']}",
         f"- Current mapped ledger/party rows checked: {len(current_trial_rows)}",
         "",

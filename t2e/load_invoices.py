@@ -27,6 +27,7 @@ import urllib.parse
 from .config import get_config
 from .erpnext_client import ERPNextClient, ERPNextError
 from .lines import is_round_ledger, is_tax_ledger, parse_entries
+from .load_masters import _valid_gstin
 from .mapping import CompanyDefaults, LedgerResolver, Resolved
 from .staging import Staging
 
@@ -188,7 +189,12 @@ class InvoiceLoader:
                     "source_total": round(source_total, 2),
                     "unrounded_total": round(unrounded_total, 2),
                 }
-        party_gstin = _scalar(payload.get("PARTYGSTIN"))
+        party_gstin = _scalar(payload.get("PARTYGSTIN")).strip().upper()
+        if party_gstin and not _valid_gstin(party_gstin):
+            raise ERPNextError(
+                f"Invalid source GSTIN {party_gstin!r} for {kind} "
+                f"{party_res.party}; correct it in Tally before migration"
+            )
         place = _place_of_supply(
             _scalar(payload.get("PLACEOFSUPPLY"))
             or _scalar(payload.get("STATENAME")),
@@ -394,9 +400,10 @@ class InvoiceLoader:
                         party, billname, doctype, existing)
                     stats["skipped"] += 1
                 else:
-                    self.store.mark(
-                        "voucher", vrow["guid"], "error",
-                        error=_error_detail(exc)[:2000])
+                    if not self.erp.dry_run:
+                        self.store.mark(
+                            "voucher", vrow["guid"], "error",
+                            error=_error_detail(exc)[:2000])
                     stats["error"] += 1
             if i % 50 == 0:
                 self.store.conn.commit()

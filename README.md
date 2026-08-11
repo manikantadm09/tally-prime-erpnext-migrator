@@ -46,6 +46,7 @@ data/reports/              reconciliation evidence (local only)
 
 - Tally groups and ledgers into ERPNext accounts.
 - Sundry Debtors and Sundry Creditors into Customers and Suppliers.
+- Party billing addresses, contacts, and valid GST registrations.
 - Sales, Purchase, Credit Note, and Debit Note vouchers into ERPNext invoices.
 - Receipts, Payments, Journals, and Contra vouchers into Payment Entries or
   Journal Entries while preserving their GL lines.
@@ -119,6 +120,15 @@ accounts substituted by ERPNext/India Compliance. It must run before period
 closing. Run the default dry-run path first and take an ERPNext backup before
 using `--confirm`.
 
+`load-masters` also rebinds staged ledger mappings to the current target
+company. This matters when the same staging database was first used on a local
+test company with a different abbreviation. It promotes only blank or
+Unregistered parties when a checksum-valid voucher GSTIN proves registration;
+invalid GSTINs are reported and are not forced into ERPNext. Tally master kinds
+outside the accounting-only scope (Godown, Cost Category, Tax Unit, and Voucher
+Type metadata) are explicitly marked skipped in staging instead of remaining
+misleadingly pending.
+
 Payment allocation is intentionally not applied by `run-all`. Review it as a
 separate operation because it uses FIFO within each party and can change many
 invoice/payment references without changing the GL:
@@ -179,6 +189,19 @@ Accept a migration only after all of the following are true:
 - Any ERPNext-only stock or period-closing entries are documented and separately
   reconciled; do not compare their gross Trial Balance movement directly with
   raw Tally Day Book turnover.
+
+Use `python tools/verify_financials_api.py` for the read-only, document-linked
+GL replay. The verifier resolves accounts and submitted documents from their
+live `tally_guid`, so a stale test-site suffix in staging cannot create a false
+result. It reports exact voucher matches separately from accepted one-paise
+tolerance exceptions and names every exception.
+
+ERPNext's standard Balance Sheet headline can differ visually from Tally even
+when the ledger replay is exact. Tally may move debit balances under Current
+Liabilities to the asset side and display the current loss as `Profit & Loss
+A/c`; ERPNext shows the same current loss as Provisional Profit/Loss. Compare
+the underlying ledger balances and the accounting equation, not only the four
+dashboard cards.
 
 ## Development
 

@@ -7,6 +7,8 @@ ledger names to posting targets.
 """
 from __future__ import annotations
 
+import re
+
 from .config import get_config
 from .erpnext_client import ERPNextClient, ERPNextError
 from .lines import is_round_ledger
@@ -57,6 +59,25 @@ IDEMPOTENT_DOCTYPES = [
     "Journal Entry", "Payment Entry", "Sales Invoice", "Purchase Invoice",
     "Period Closing Voucher", "Address", "Contact",
 ]
+
+# These source master types are extraction/audit metadata, but do not create
+# standalone ERPNext documents in the accounting-only migration scope.
+OUT_OF_SCOPE_MASTER_KINDS = {
+    "costcategory": (
+        "Financial migration has no cost-category allocations to recreate"
+    ),
+    "godown": (
+        "Financial migration does not recreate warehouse or stock masters"
+    ),
+    "taxunit": (
+        "Tax Unit is consumed as company GST registration metadata; no "
+        "standalone ERPNext Tax Unit document is created"
+    ),
+    "vouchertype": (
+        "Voucher Type is routing metadata handled by voucher_map; no "
+        "standalone ERPNext master is created"
+    ),
+}
 
 
 def fetch_company_defaults(erp: ERPNextClient) -> CompanyDefaults:
@@ -131,6 +152,23 @@ _GST_STATE = {
     "35": "Andaman and Nicobar Islands", "36": "Telangana", "37": "Andhra Pradesh",
     "38": "Ladakh",
 }
+
+_GSTIN_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _valid_gstin(value: str) -> bool:
+    """Validate GSTIN shape and the official base-36 check digit."""
+    gstin = (value or "").strip().upper()
+    if not re.fullmatch(r"[0-9]{2}[A-Z0-9]{13}", gstin):
+        return False
+    factor = 2
+    total = 0
+    for char in reversed(gstin[:-1]):
+        product = _GSTIN_CHARS.index(char) * factor
+        total += product // 36 + product % 36
+        factor = 1 if factor == 2 else 2
+    expected = _GSTIN_CHARS[(36 - total % 36) % 36]
+    return gstin[-1] == expected
 
 _COUNTRY_ALIASES = {
     "UK": "United Kingdom",
@@ -333,6 +371,147 @@ class MasterLoader:
         # Never let a dry-run make staging claim a master exists in ERPNext.
         if not self.erp.dry_run:
             self.store.mark("master", guid, status, doctype, erp_name, err)
+
+    def classify_out_of_scope_masters(self) -> int:
+        """Close audit-only source rows without discarding their payload."""
+        count = 0
+        for kind, reason in OUT_OF_SCOPE_MASTER_KINDS.items():
+            for row in self.store.masters(kind, status="pending"):
+                count += 1
+                self._mark(
+                    row["guid"], f"Tally {kind}", row["name"],
+                    "skipped", reason,
+                )
+        if not self.erp.dry_run:
+            self.store.conn.commit()
+        return count
+
+    def sync_party_gst_categories(self) -> dict[str, int]:
+        """Synchronize registered parties from valid voucher GST evidence.
+
+        Existing explicit Composition, SEZ, Overseas, or other categories are
+        preserved. Malformed or checksum-invalid GSTINs remain source evidence
+        and are reported instead of being forced into ERPNext.
+        """
+        observed: dict[tuple[str, str], dict[str, str]] = {}
+        conflicting: set[tuple[str, str]] = set()
+        invalid: set[tuple[str, str, str]] = set()
+        for voucher in self.store.vouchers():
+            if voucher["vtype"] in ("Sales", "Credit Note"):
+                doctype = "Customer"
+            elif voucher["vtype"] in ("Purchase", "Debit Note"):
+                doctype = "Supplier"
+            else:
+                continue
+            party = " ".join((voucher["party"] or "").split())
+            payload = _json(voucher["payload"])
+            gstin = str(payload.get("PARTYGSTIN") or "").strip().upper()
+            if not _valid_gstin(gstin):
+                if party and gstin:
+                    invalid.add((doctype, party, gstin))
+                continue
+            if party:
+                key = (doctype, party)
+                if key in observed and observed[key]["gstin"] != gstin:
+                    conflicting.add(key)
+                    continue
+                observed[key] = {
+                    "gstin": gstin,
+                    "state": _GST_STATE.get(
+                        gstin[:2],
+                        str(
+                            payload.get("STATENAME")
+                            or payload.get("PLACEOFSUPPLY")
+                            or self.cfg.erpnext.get("company_state", "")
+                        ).strip(),
+                    ),
+                }
+
+        masters = {
+            " ".join((row["name"] or "").split()): row
+            for row in self.store.masters("ledger")
+        }
+        for key in conflicting:
+            observed.pop(key, None)
+        for doctype, party, gstin in sorted(invalid):
+            print(
+                f"  ! invalid source GSTIN (not applied): {doctype} "
+                f"{party} -> {gstin}"
+            )
+        stats = {
+            "observed": len(observed), "updated": 0,
+            "already_registered": 0, "missing_party": 0,
+            "missing_source_master": 0,
+            "conflicting_valid_gstins": len(conflicting),
+            "invalid_source_gstins": len(invalid), "errors": 0,
+        }
+        for (doctype, party), source in sorted(observed.items()):
+            if not self.erp.has_field(doctype, "gst_category"):
+                continue
+            rows = self.erp.get_list(
+                doctype,
+                fields=["name", "gst_category"],
+                filters=[["name", "=", party]],
+                limit=1,
+            )
+            if not rows:
+                stats["missing_party"] += 1
+                continue
+            category = str(rows[0].get("gst_category") or "").strip()
+            if category not in ("", "Unregistered"):
+                stats["already_registered"] += 1
+                continue
+            master = masters.get(party)
+            if not master:
+                stats["missing_source_master"] += 1
+                continue
+            stats["updated"] += 1
+            if self.erp.dry_run:
+                continue
+            try:
+                address_key = f"{master['guid']}:Address"
+                address = self.erp.find_by_field(
+                    "Address", self.field, address_key)
+                values = {
+                    "gstin": source["gstin"],
+                    "gst_category": "Registered Regular",
+                    "is_primary_address": 1,
+                    "state": source["state"],
+                }
+                if address:
+                    self.erp.update("Address", address, values)
+                else:
+                    created = self.erp.insert("Address", {
+                        "address_title": party,
+                        "address_type": "Billing",
+                        "address_line1": party,
+                        "city": source["state"] or "NA",
+                        "state": source["state"],
+                        "country": self.cfg.erpnext.get("country", "India"),
+                        "links": [{"link_doctype": doctype,
+                                   "link_name": party}],
+                        self.field: address_key,
+                        **values,
+                    })
+                    address = (
+                        (created.get("data") or {}).get("name")
+                        if isinstance(created, dict) else None
+                    )
+                primary_field = (
+                    "customer_primary_address"
+                    if doctype == "Customer" else "supplier_primary_address"
+                )
+                party_values = {"gst_category": "Registered Regular"}
+                if address and self.erp.has_field(doctype, primary_field):
+                    party_values[primary_field] = address
+                self.erp.update(doctype, rows[0]["name"], party_values)
+            except ERPNextError as exc:
+                stats["errors"] += 1
+                print(
+                    f"  ! GST registration sync failed for {doctype} "
+                    f"{party}: {str(exc)[:240]}"
+                )
+        return stats
 
     # ---- Suspense fallback account --------------------------------------
     def ensure_suspense(self) -> None:

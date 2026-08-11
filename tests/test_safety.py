@@ -22,6 +22,7 @@ from t2e.load_invoices import (
 from t2e.load_masters import (
     MasterLoader,
     _insert_with_source_validation_fallback,
+    _valid_gstin,
 )
 from t2e.ledger_fidelity import account_deltas
 from t2e.load_period_closing import PeriodClosingLoader
@@ -32,6 +33,7 @@ from t2e.staging import Staging
 from t2e.sync_report import build_report
 from t2e.tally_export import effective_from_date, extract_vouchers, stage_voucher_export
 from t2e.wipe import wipe
+from tools.verify_financials_api import source_postings, voucher_verification
 
 
 def defaults() -> CompanyDefaults:
@@ -101,6 +103,52 @@ class NamingTests(unittest.TestCase):
 
 
 class InvoiceFidelityTests(unittest.TestCase):
+    def test_invalid_source_gstin_fails_closed_without_mutating_dry_run(self):
+        class ERP:
+            dry_run = True
+
+            @staticmethod
+            def has_field(doctype, fieldname):
+                return True
+
+            @staticmethod
+            def find_by_field(*args, **kwargs):
+                return None
+
+        supplier = Resolved(
+            "party", "Creditors - TC", "Supplier", "Bad GST Supplier")
+
+        class Resolver:
+            @staticmethod
+            def get(name):
+                return {
+                    "Bad GST Supplier": supplier,
+                    "Purchases": Resolved("account", "Purchases - TC"),
+                }.get(name)
+
+            @staticmethod
+            def get_party(name, party_type):
+                return supplier if name == "Bad GST Supplier" else None
+
+        with TemporaryStaging() as store:
+            store.upsert_voucher(
+                "bad-gstin-guid", "Purchase", "1", "2026-04-01",
+                "Bad GST Supplier", 100,
+                {
+                    "PARTYGSTIN": "29ALVPP7902L1ZA",
+                    "ALLLEDGERENTRIES.LIST": [
+                        {"LEDGERNAME": "Bad GST Supplier", "AMOUNT": "100"},
+                        {"LEDGERNAME": "Purchases", "AMOUNT": "-100"},
+                    ],
+                },
+            )
+            stats = InvoiceLoader(
+                ERP(), store, defaults(), Resolver()).run()
+            row = store.voucher_by_guid("bad-gstin-guid")
+            self.assertEqual(stats["error"], 1)
+            self.assertEqual(row["load_status"], "pending")
+            self.assertIsNone(row["error"])
+
     def test_ledger_fidelity_delta_reclassifies_without_changing_value(self):
         desired = {
             ("IGST INPUT @ 18 % - TC", None, None): Decimal("180.00"),
@@ -343,6 +391,10 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class MasterDryRunTests(unittest.TestCase):
+    def test_gstin_checksum_validation(self):
+        self.assertTrue(_valid_gstin("36AALCA0171E1Z0"))
+        self.assertFalse(_valid_gstin("29ALVPP7902L1ZA"))
+
     def test_dry_run_does_not_mark_master_as_loaded(self):
         with TemporaryStaging() as store:
             store.upsert_master("ledger", "master-guid", "New Ledger", None, {})
@@ -351,6 +403,204 @@ class MasterDryRunTests(unittest.TestCase):
             loader.store = store
             loader._mark("master-guid", "Account", "New Ledger - TC")
             self.assertEqual(store.masters("ledger")[0]["load_status"], "pending")
+
+    def test_out_of_scope_masters_are_explicitly_classified_on_confirm(self):
+        with TemporaryStaging() as store:
+            kinds = ("costcategory", "godown", "taxunit", "vouchertype")
+            for kind in kinds:
+                store.upsert_master(kind, f"{kind}-guid", kind, None, {})
+            loader = MasterLoader.__new__(MasterLoader)
+            loader.erp = SimpleNamespace(dry_run=False)
+            loader.store = store
+
+            self.assertEqual(loader.classify_out_of_scope_masters(), 4)
+            for kind in kinds:
+                row = store.masters(kind)[0]
+                self.assertEqual(row["load_status"], "skipped")
+                self.assertTrue(row["error"])
+
+    def test_out_of_scope_master_classification_is_a_dry_run_noop(self):
+        with TemporaryStaging() as store:
+            store.upsert_master(
+                "vouchertype", "voucher-type-guid", "Sales", None, {})
+            loader = MasterLoader.__new__(MasterLoader)
+            loader.erp = SimpleNamespace(dry_run=True)
+            loader.store = store
+
+            self.assertEqual(loader.classify_out_of_scope_masters(), 1)
+            self.assertEqual(
+                store.masters("vouchertype")[0]["load_status"], "pending")
+
+    def test_gstin_voucher_promotes_only_unregistered_party_category(self):
+        with TemporaryStaging() as store:
+            for guid, party in (("v1", "Regular Supplier"),
+                                ("v2", "Composition Supplier")):
+                store.upsert_master(
+                    "ledger", f"{guid}-master", party,
+                    "Sundry Creditors", {},
+                )
+                store.upsert_voucher(
+                    guid, "Purchase", guid, "2026-04-01", party, 100,
+                    {"PARTYGSTIN": "36AALCA0171E1Z0"},
+                )
+
+            class ERP:
+                dry_run = False
+                categories = {
+                    "Regular Supplier": "Unregistered",
+                    "Composition Supplier": "Registered Composition",
+                }
+
+                @staticmethod
+                def has_field(doctype, fieldname):
+                    return True
+
+                def get_list(self, doctype, fields=None, filters=None, limit=0):
+                    party = filters[0][2]
+                    return [{"name": party,
+                             "gst_category": self.categories[party]}]
+
+                def update(self, doctype, name, values):
+                    if doctype == "Supplier":
+                        self.categories[name] = values["gst_category"]
+
+                @staticmethod
+                def find_by_field(doctype, field, value):
+                    return "Regular Supplier-Billing"
+
+            loader = MasterLoader.__new__(MasterLoader)
+            loader.erp = ERP()
+            loader.store = store
+            loader.field = "tally_guid"
+            loader.cfg = SimpleNamespace(
+                erpnext={"company_state": "Karnataka", "country": "India"})
+            result = loader.sync_party_gst_categories()
+
+            self.assertEqual(result["updated"], 1)
+            self.assertEqual(result["already_registered"], 1)
+            self.assertEqual(
+                loader.erp.categories["Regular Supplier"],
+                "Registered Regular",
+            )
+            self.assertEqual(
+                loader.erp.categories["Composition Supplier"],
+                "Registered Composition",
+            )
+
+
+class VoucherDryRunTests(unittest.TestCase):
+    def test_loader_exception_does_not_mutate_staging_in_dry_run(self):
+        class ERP:
+            dry_run = True
+
+            @staticmethod
+            def find_by_field(*args, **kwargs):
+                return None
+
+        with TemporaryStaging() as store:
+            store.upsert_voucher(
+                "dry-error", "Journal", "1", "2026-04-01", None, 1, {})
+            loader = VoucherLoader(ERP(), store, defaults(), object())
+            with patch.object(
+                    loader, "load_one", side_effect=RuntimeError("planned")):
+                stats = loader.run()
+            row = store.voucher_by_guid("dry-error")
+            self.assertEqual(stats["error"], 1)
+            self.assertEqual(row["load_status"], "pending")
+            self.assertIsNone(row["error"])
+
+
+class FinancialVerifierMappingTests(unittest.TestCase):
+    def test_voucher_verifier_uses_live_guid_and_reports_paise_separately(self):
+        with TemporaryStaging() as store:
+            store.upsert_voucher(
+                "live-guid", "Purchase", "1", "2026-04-01",
+                "Supplier", 100, {},
+            )
+            store.mark(
+                "voucher", "live-guid", "loaded",
+                "Purchase Invoice", "STALE-TEST-SITE-NAME",
+            )
+            summary, differences = voucher_verification(
+                store,
+                [{"voucher_no": "PINV-LIVE", "debit": 100.01,
+                  "credit": 100.01}],
+                {"live-guid": {"name": "PINV-LIVE"}},
+            )
+
+            self.assertEqual(summary["exact_amount_matches"], 0)
+            self.assertEqual(summary["within_paise_tolerance_matches"], 1)
+            self.assertEqual(summary["tolerance_exception_count"], 1)
+            self.assertEqual(summary["missing_target_gl"], 0)
+            self.assertEqual(differences, [])
+
+    def test_live_target_identity_overrides_stale_company_suffixes(self):
+        with TemporaryStaging() as store:
+            masters = [
+                ("sales-guid", "Sales Ledger", "Sales Ledger - OLD"),
+                ("round-guid", "ROUNDING OFF", "ROUNDING OFF - OLD"),
+                ("pl-guid", "Profit & Loss A/c", "Profit & Loss A/c - OLD"),
+            ]
+            for guid, name, stale_target in masters:
+                store.upsert_master("ledger", guid, name, None, {})
+                store.mark("master", guid, "loaded", "Account", stale_target)
+            store.upsert_voucher(
+                "voucher-guid", "Journal", "1", "2026-04-01", None, 0,
+                {"ALLLEDGERENTRIES.LIST": [
+                    {"LEDGERNAME": "Sales Ledger", "AMOUNT": "100"},
+                    {"LEDGERNAME": "ROUNDING OFF", "AMOUNT": "-1"},
+                    {"LEDGERNAME": "Profit & Loss A/c", "AMOUNT": "-99"},
+                ]},
+            )
+            account_meta = {
+                "Sales Ledger - TC": {
+                    "account_name": "Sales Ledger", "is_group": 0,
+                    "tally_guid": "sales-guid", "root_type": "Income",
+                },
+                "Round Off - TC": {
+                    "account_name": "Round Off", "is_group": 0,
+                    "tally_guid": None, "root_type": "Expense",
+                },
+                "Reserves and Surplus - TC": {
+                    "account_name": "Reserves and Surplus", "is_group": 0,
+                    "tally_guid": None, "root_type": "Liability",
+                },
+                "Closing Stock - TC": {
+                    "account_name": "Closing Stock", "is_group": 0,
+                    "tally_guid": None, "root_type": "Asset",
+                },
+                "Opening Stock - TC": {
+                    "account_name": "Opening Stock", "is_group": 0,
+                    "tally_guid": None, "root_type": "Expense",
+                },
+                "Closing Stock (P&L) - TC": {
+                    "account_name": "Closing Stock (P&L)", "is_group": 0,
+                    "tally_guid": None, "root_type": "Income",
+                },
+            }
+            cfg = SimpleNamespace(
+                staging_db=Path(
+                    store.conn.execute("PRAGMA database_list").fetchone()[2]),
+                erpnext={
+                    "retained_earnings_account": "Reserves and Surplus"},
+            )
+            closing = {
+                "asset_account": "Closing Stock",
+                "opening_pl_name": "Opening Stock",
+                "closing_pl_name": "Closing Stock (P&L)",
+                "balances": {},
+            }
+            with patch(
+                    "tools.verify_financials_api.get_config",
+                    return_value=cfg):
+                postings = source_postings(
+                    store, defaults(), "20220101", closing, account_meta)
+
+            accounts = {row["ledger"]: row["account"] for row in postings}
+            self.assertEqual(accounts["Sales Ledger"], "Sales Ledger - TC")
+            self.assertEqual(accounts["ROUNDING OFF"], "Round Off - TC")
+            self.assertEqual(
+                accounts["Profit & Loss A/c"], "Reserves and Surplus - TC")
 
 
 class TallyExtractionTests(unittest.TestCase):

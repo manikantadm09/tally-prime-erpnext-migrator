@@ -116,8 +116,11 @@ def _masters(erp: ERPNextClient, s: Staging):
     print("  ledger accounts:", ml.load_ledger_accounts())
     nc, ns = ml.load_parties()
     print(f"  customers: {nc}  suppliers: {ns}")
+    print("  party GST categories:", ml.sync_party_gst_categories())
     print("  cost centers:", ml.load_cost_centers())
     print("  items:", ml.load_items())
+    print("  audit-only masters classified:",
+          ml.classify_out_of_scope_masters())
     return defaults
 
 

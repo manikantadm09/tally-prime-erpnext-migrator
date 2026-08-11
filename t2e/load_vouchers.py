@@ -336,14 +336,14 @@ class VoucherLoader:
                     continue
                 doctype, name = self.load_one(vrow)
                 if self.erp.dry_run:
-                    self.store.mark("voucher", vrow["guid"], "pending", doctype, None)
                     stats["planned"] += 1
                 else:
                     self.store.mark("voucher", vrow["guid"], "loaded", doctype, name)
                     stats["loaded"] += 1
             except Exception as exc:  # noqa: BLE001
-                self.store.mark("voucher", vrow["guid"], "error",
-                                error=str(exc)[:800])
+                if not self.erp.dry_run:
+                    self.store.mark("voucher", vrow["guid"], "error",
+                                    error=str(exc)[:800])
                 stats["error"] += 1
             if i % 50 == 0:
                 self.store.conn.commit()
