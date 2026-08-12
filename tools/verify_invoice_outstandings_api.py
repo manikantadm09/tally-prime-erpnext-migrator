@@ -15,6 +15,7 @@ from tools.verify_bill_outstandings_api import (
     norm,
     parse_tally_bills,
 )
+from tools.plan_exact_bill_allocations_api import source_graph
 
 
 DIRECTION = {"Sales": "Receivable", "Purchase": "Payable"}
@@ -90,7 +91,14 @@ def main() -> None:
     store = Staging()
     records = []
     return_ref_keys: set[tuple[str, str, str]] = set()
-    for row in store.vouchers():
+    vouchers = [dict(row) for row in store.vouchers()]
+    return_guids = {
+        str(row["guid"]) for row in vouchers
+        if row["vtype"] in RETURN_DIRECTION
+    }
+    party_keys = {norm(row["party"] or ""): "Party" for row in vouchers}
+    return_origins, return_funding = source_graph(vouchers, party_keys)
+    for row in vouchers:
         return_direction = RETURN_DIRECTION.get(row["vtype"])
         if return_direction:
             refs, _, _ = source_invoice_bill_data(row)
@@ -184,6 +192,13 @@ def main() -> None:
         has_return_source = any(
             (group["direction"], norm(group["party"]), ref_key)
             in return_ref_keys for ref_key in group["ref_keys"])
+        if not has_return_source:
+            candidate_return_guids = set()
+            for ref_key in group["ref_keys"]:
+                graph_key = (norm(group["party"]), ref_key)
+                candidate_return_guids.update(return_origins.get(graph_key, set()))
+                candidate_return_guids.update(return_funding.get(graph_key, set()))
+            has_return_source = bool(candidate_return_guids & return_guids)
         classification = classify_difference(difference, has_return_source)
         details.append({
             "direction": group["direction"],
