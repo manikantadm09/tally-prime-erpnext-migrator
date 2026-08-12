@@ -230,6 +230,10 @@ def main() -> None:
         "repeated_source_bill_keys": sum(r["invoice_count"] > 1 for r in details),
         "erp_open_bill_keys": sum(money(r["erp_outstanding"]) > 0 for r in details),
         "expected_open_bill_groups": sum(money(r["expected_erp_outstanding"]) > 0 for r in details),
+        "matching_open_bill_groups": sum(
+            r["matches"] and money(r["erp_outstanding"]) > 0 for r in details),
+        "matching_open_erp_outstanding": f"{sum((money(r['erp_outstanding']) for r in details if r['matches'] and money(r['erp_outstanding']) > 0), Decimal('0.00')):.2f}",
+        "matching_open_tally_expected": f"{sum((money(r['expected_erp_outstanding']) for r in details if r['matches'] and money(r['erp_outstanding']) > 0), Decimal('0.00')):.2f}",
         "erp_outstanding": f"{sum((money(r['erp_outstanding']) for r in details), Decimal('0.00')):.2f}",
         "expected_erp_outstanding": f"{sum((money(r['expected_erp_outstanding']) for r in details), Decimal('0.00')):.2f}",
         "classifications": {
