@@ -215,7 +215,8 @@ JEs, cancel them with `tools.revert_generated_return_reconciliations` and use
 the narrowly scoped server-side
 `tools/frappe_purge_generated_return_journals.py` after a fresh site backup to
 remove their immutable cancelled shells. Always run the purge without
-`--confirm` first and require identical active-GL signatures before/after.
+`--confirm` first, pass the fresh database backup path when confirming, and
+require identical active-GL signatures before/after.
 
 ## Repeat extraction and source changes
 

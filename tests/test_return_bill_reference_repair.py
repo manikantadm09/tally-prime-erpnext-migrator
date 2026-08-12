@@ -11,6 +11,9 @@ from tools.frappe_repair_return_bill_references import (
     money,
     repair_total,
 )
+from tools.frappe_purge_generated_return_journals import (
+    discover_sites_path as discover_purge_sites_path,
+)
 
 
 class ReturnBillReferenceRepairTests(unittest.TestCase):
@@ -76,6 +79,8 @@ class ReturnBillReferenceRepairTests(unittest.TestCase):
             self.assertEqual(discover_sites_path("test.local", root), root / "sites")
             self.assertEqual(
                 discover_sites_path("test.local", root / "sites"), root / "sites")
+            self.assertEqual(
+                discover_purge_sites_path("test.local", root), root / "sites")
 
 
 if __name__ == "__main__":

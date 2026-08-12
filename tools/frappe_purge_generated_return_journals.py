@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from decimal import Decimal
 import json
+import os
 from pathlib import Path
 
 
@@ -28,17 +29,27 @@ def money(value) -> Decimal:
 
 def active_gl_signature(frappe, company: str) -> dict:
     row = frappe.db.sql(
-        """select count(*) as rows, coalesce(sum(debit), 0) as debit,
+        """select count(*) as row_count, coalesce(sum(debit), 0) as debit,
                   coalesce(sum(credit), 0) as credit
              from `tabGL Entry`
             where company=%s and is_cancelled=0""",
         company, as_dict=True,
     )[0]
     return {
-        "rows": int(row.rows),
+        "rows": int(row.row_count),
         "debit": f"{money(row.debit):.2f}",
         "credit": f"{money(row.credit):.2f}",
     }
+
+
+def discover_sites_path(site: str, cwd: Path | None = None) -> Path:
+    cwd = (cwd or Path.cwd()).resolve()
+    for candidate in (cwd / "sites", cwd):
+        if (candidate / site / "site_config.json").is_file():
+            return candidate
+    raise RuntimeError(
+        f"Cannot locate {site}/site_config.json below {cwd}; run from the "
+        "bench root or its sites directory")
 
 
 def main() -> int:
@@ -46,19 +57,29 @@ def main() -> int:
     parser.add_argument("--site", required=True)
     parser.add_argument("--company", required=True)
     parser.add_argument("--confirm-company", required=True)
+    parser.add_argument("--backup", help="Existing fresh database backup path")
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--report")
     args = parser.parse_args()
     if args.company != args.confirm_company:
         raise SystemExit("Confirmation does not exactly match company")
+    backup = Path(args.backup).resolve() if args.backup else None
+    report_path = Path(args.report).resolve() if args.report else None
+    if args.confirm and (
+        backup is None or not backup.is_file() or backup.stat().st_size == 0
+    ):
+        raise SystemExit("--confirm requires a non-empty --backup file")
 
     import frappe
 
     already_connected = bool(
         getattr(frappe.local, "initialised", False)
         and getattr(frappe.local, "db", None))
+    original_cwd = Path.cwd()
     if not already_connected:
-        frappe.init(site=args.site, sites_path=str(Path.cwd() / "sites"), force=True)
+        sites_path = discover_sites_path(args.site, original_cwd)
+        os.chdir(sites_path)
+        frappe.init(site=args.site, sites_path=str(sites_path), force=True)
         frappe.connect()
     elif frappe.local.site != args.site:
         raise RuntimeError(
@@ -124,6 +145,7 @@ def main() -> int:
             "site": args.site,
             "company": args.company,
             "plan_only": not args.confirm,
+            "backup": str(backup) if backup else None,
             "validated": validated,
             "deleted_derived": deleted_derived,
             "deleted_parents": 0 if not args.confirm else len(EXPECTED) - len(remaining),
@@ -134,12 +156,13 @@ def main() -> int:
         }
         text = json.dumps(result, indent=2)
         print(text, flush=True)
-        if args.report:
-            Path(args.report).write_text(text + "\n", encoding="utf-8")
+        if report_path:
+            report_path.write_text(text + "\n", encoding="utf-8")
         return 0 if passed else 2
     finally:
         if not already_connected:
             frappe.destroy()
+            os.chdir(original_cwd)
 
 
 if __name__ == "__main__":
