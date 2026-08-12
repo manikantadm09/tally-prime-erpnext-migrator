@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 import json
 from pathlib import Path
-import sqlite3
 import sys
 import urllib.parse
 
@@ -14,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from t2e.erpnext_client import ERPNextClient, ERPNextError  # noqa: E402
+from t2e.config import get_config  # noqa: E402
 
 REPORT_DATE = date.today().isoformat()
 INVOICE_TYPES = ("Sales Invoice", "Purchase Invoice")
@@ -32,16 +32,23 @@ def blank(value) -> bool:
 
 
 def main() -> int:
-    db = sqlite3.connect(ROOT / "data" / "staging.sqlite")
-    db.row_factory = sqlite3.Row
-    rows = db.execute(
-        """SELECT guid,erp_doctype,erp_name
-             FROM voucher
-            WHERE erp_doctype IN ('Sales Invoice','Purchase Invoice')
-              AND erp_name IS NOT NULL
-            ORDER BY erp_doctype,erp_name"""
-    ).fetchall()
-    targets = [(r["erp_doctype"], r["erp_name"]) for r in rows]
+    erp = ERPNextClient(dry_run=True)
+    company = get_config().erpnext["company"]
+    targets = []
+    for doctype in INVOICE_TYPES:
+        targets.extend(
+            (doctype, row["name"])
+            for row in erp.get_list(
+                doctype,
+                fields=["name"],
+                filters=[
+                    ["company", "=", company],
+                    ["docstatus", "=", 1],
+                    ["tally_guid", "is", "set"],
+                ],
+                limit=0,
+            )
+        )
     docs = []
     errors = []
     with ThreadPoolExecutor(max_workers=8) as pool:

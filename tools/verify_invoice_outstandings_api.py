@@ -248,7 +248,12 @@ def main() -> None:
             )
         },
     }
-    payload = {"summary": summary, "differences": differences, "ambiguous": ambiguous}
+    payload = {
+        "summary": summary,
+        "details": details,
+        "differences": differences,
+        "ambiguous": ambiguous,
+    }
     report = reports / "invoice_outstanding_verification.json"
     report.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
