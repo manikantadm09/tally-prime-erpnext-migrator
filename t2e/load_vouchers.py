@@ -81,9 +81,13 @@ class VoucherLoader:
             bills = []
             for b in _as_list(le.get("BILLALLOCATIONS.LIST")):
                 if isinstance(b, dict) and b.get("NAME"):
-                    # Bill amounts are signed in Tally; use magnitude for allocation.
+                    # Preserve the signed amount for exact Tally-reference
+                    # reconciliation. Existing loaders still use ``amount`` as
+                    # a magnitude, so this is backward compatible.
+                    signed_amount = _f(b.get("AMOUNT"))
                     bills.append({"name": b.get("NAME"), "type": b.get("BILLTYPE"),
-                                  "amount": abs(_f(b.get("AMOUNT")))})
+                                  "amount": abs(signed_amount),
+                                  "signed_amount": signed_amount})
             out.append({"ledger": ledger, "magnitude": abs(amt),
                         "is_debit": is_debit, "bills": bills})
         return out

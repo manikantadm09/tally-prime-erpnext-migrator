@@ -20,6 +20,8 @@ def main() -> None:
             "profit-loss",
             "trial-balance",
             "ledger-balances",
+            "bills-receivable",
+            "bills-payable",
         ],
     )
     parser.add_argument("--from-date", required=True)
@@ -29,6 +31,8 @@ def main() -> None:
         "balance-sheet": "Balance Sheet",
         "profit-loss": "Profit and Loss",
         "trial-balance": "Trial Balance",
+        "bills-receivable": "Bills Receivable",
+        "bills-payable": "Bills Payable",
     }
     client = TallyClient()
     if args.report == "ledger-balances":

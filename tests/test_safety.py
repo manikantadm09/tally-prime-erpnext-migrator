@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,11 +30,13 @@ from t2e.load_period_closing import PeriodClosingLoader
 from t2e.load_vouchers import VoucherLoader
 from t2e.mapping import CompanyDefaults, Resolved
 from t2e.reconcile import _count_migrated
+from t2e.repair_party_bridges import financial_signature, unreconcile_selections
 from t2e.staging import Staging
 from t2e.sync_report import build_report
 from t2e.tally_export import effective_from_date, extract_vouchers, stage_voucher_export
 from t2e.wipe import wipe
 from tools.verify_financials_api import source_postings, voucher_verification
+from tools.audit_invoice_status_api import summarize as summarize_invoices
 
 
 def defaults() -> CompanyDefaults:
@@ -380,6 +383,29 @@ class InvoiceFidelityTests(unittest.TestCase):
             ERP(), Store(), defaults(), Resolver())._build(row)
         self.assertIsNotNone(built[-1])
 
+    def test_party_control_bridge_uses_supported_unreconcile_shape(self):
+        rows = unreconcile_selections(
+            "Test Company", "ACC-JV-1", [{
+                "reference_type": "Purchase Invoice",
+                "reference_name": "PINV-1",
+            }])
+        self.assertEqual(rows, [{
+            "company": "Test Company",
+            "voucher_type": "Journal Entry",
+            "voucher_no": "ACC-JV-1",
+            "against_voucher_type": "Purchase Invoice",
+            "against_voucher_no": "PINV-1",
+        }])
+
+    def test_financial_signature_ignores_reference_metadata(self):
+        before = [{"account": "Creditors - TC", "party_type": "Supplier",
+                   "party": "Vendor", "debit": 100, "credit": 0,
+                   "against_voucher_type": "Purchase Invoice",
+                   "against_voucher": "PINV-1"}]
+        after = [{**before[0], "against_voucher_type": None,
+                  "against_voucher": None}]
+        self.assertEqual(financial_signature(before), financial_signature(after))
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_tally_config_does_not_load_erp_secret_files(self):
@@ -601,6 +627,23 @@ class FinancialVerifierMappingTests(unittest.TestCase):
             self.assertEqual(accounts["ROUNDING OFF"], "Round Off - TC")
             self.assertEqual(
                 accounts["Profit & Loss A/c"], "Reserves and Surplus - TC")
+
+
+class InvoiceStatusAuditTests(unittest.TestCase):
+    def test_returns_are_not_counted_as_overdue_positive_outstanding(self):
+        summary = summarize_invoices([
+            {"status": "Overdue", "due_date": "2026-01-01",
+             "outstanding_amount": 100},
+            {"status": "Return", "due_date": "2026-01-01",
+             "outstanding_amount": -20},
+            {"status": "Paid", "due_date": "2026-01-01",
+             "outstanding_amount": 0},
+        ], today=date(2026, 8, 11))
+
+        self.assertEqual(summary["overdue_count"], 1)
+        self.assertEqual(summary["overdue_outstanding"], "100.00")
+        self.assertEqual(summary["open_return_count"], 1)
+        self.assertEqual(summary["open_return_credit"], "20.00")
 
 
 class TallyExtractionTests(unittest.TestCase):

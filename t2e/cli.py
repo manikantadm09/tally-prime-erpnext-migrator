@@ -261,6 +261,12 @@ def cmd_reconcile(args) -> int:
 def cmd_reconcile_payments(args) -> int:
     from .load_masters import fetch_company_defaults
     from .reconcile_payments import PaymentReconciler
+    if args.confirm and not args.acknowledge_non_tally_fifo:
+        print("  ! refused: FIFO allocation does not reproduce Tally bill references. "
+              "Use the exact-reference workflow for migration fidelity. If FIFO is "
+              "an explicitly approved business choice, pass "
+              "--acknowledge-non-tally-fifo.")
+        return 2
     erp = ERPNextClient(dry_run=not args.confirm)
     _banner(erp.dry_run)
     if erp.dry_run:
@@ -275,6 +281,42 @@ def cmd_reconcile_payments(args) -> int:
     stats = pr.run(only_party=args.party, limit=args.limit, progress=prog)
     print("  payment reconciliation:", stats)
     print("  -> report: data/reports/payment_reconciliation.{json,csv}")
+    return 0
+
+
+def cmd_repair_party_bridges(args) -> int:
+    from .repair_party_bridges import PartyBridgeRepair
+    cfg = get_config()
+    erp = ERPNextClient(dry_run=not args.confirm)
+    _banner(erp.dry_run)
+    repair = PartyBridgeRepair(erp, cfg.idempotency_field)
+    payload = repair.run(names=args.name or None)
+    print(f"  party-control bridges: candidates={payload['candidate_count']} "
+          f"mode={payload['mode']} pass={payload['pass']}")
+    for row in payload["results"]:
+        print(f"  {row['journal_entry']}: {row['status']} "
+              f"references={row.get('references', 0)} {row.get('error', '')}")
+    print(f"  -> report: {payload['report']}")
+    return 0 if payload["pass"] else 1
+
+
+def cmd_reconcile_exact_bills(args) -> int:
+    from pathlib import Path
+    from .exact_bill_reconciliation import ExactBillReconciler
+    cfg = get_config()
+    erp = ERPNextClient(dry_run=not args.confirm)
+    _banner(erp.dry_run)
+    plan = Path(args.plan) if args.plan else (
+        cfg.staging_db.parent / "reports" / "exact_bill_allocation_plan.json")
+    reconciler = ExactBillReconciler(erp, plan)
+    payload = reconciler.run(only_party=args.party)
+    print(f"  exact bill reconciliation: parties={payload['selected_parties']} "
+          f"allocated={payload['allocated']} pass={payload['pass']}")
+    for row in payload["results"]:
+        print(f"  {row.get('party_type', '')} {row.get('party', '')}: "
+              f"{row['status']} allocations={row.get('allocations', 0)} "
+              f"amount={row.get('allocated', '0.00')}")
+    print(f"  -> report: {payload['report']}")
     return 0
 
 
@@ -501,7 +543,29 @@ def main(argv=None) -> int:
     rp.add_argument("--confirm", action="store_true", help="execute reconciliation")
     rp.add_argument("--party", default=None, help="only this customer/supplier")
     rp.add_argument("--limit", type=int, default=0, help="max parties to process")
+    rp.add_argument(
+        "--acknowledge-non-tally-fifo", action="store_true",
+        help="required with --confirm: acknowledges FIFO may change bill-wise "
+             "aging and will not reproduce Tally bill references")
     rp.set_defaults(func=cmd_reconcile_payments)
+
+    pb = sub.add_parser(
+        "repair-party-bridges",
+        help="replace party-control bridge JEs without invoice references")
+    pb.add_argument("--confirm", action="store_true", help="execute replacements")
+    pb.add_argument("--name", action="append", default=[],
+                    help="repair only this Journal Entry (repeatable; use for pilot)")
+    pb.set_defaults(func=cmd_repair_party_bridges)
+
+    eb = sub.add_parser(
+        "reconcile-exact-bills",
+        help="apply a reviewed Tally-reference exact bill allocation plan")
+    eb.add_argument("--confirm", action="store_true", help="execute reconciliation")
+    eb.add_argument("--party", default=None,
+                    help="only this exact customer/supplier (recommended pilot)")
+    eb.add_argument("--plan", default=None,
+                    help="plan JSON (default: data/reports/exact_bill_allocation_plan.json)")
+    eb.set_defaults(func=cmd_reconcile_exact_bills)
 
     lf = sub.add_parser(
         "load-ledger-fidelity",

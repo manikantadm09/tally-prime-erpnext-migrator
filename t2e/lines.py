@@ -41,8 +41,10 @@ def parse_entries(payload: dict) -> list[dict]:
         bills = []
         for b in as_list(le.get("BILLALLOCATIONS.LIST")):
             if isinstance(b, dict) and b.get("NAME"):
+                signed_amount = to_float(b.get("AMOUNT"))
                 bills.append({"name": b.get("NAME"), "type": b.get("BILLTYPE"),
-                              "amount": abs(to_float(b.get("AMOUNT"))),
+                              "amount": abs(signed_amount),
+                              "signed_amount": signed_amount,
                               "bill_date": b.get("BILLDATE")
                                   or b.get("BILLCREATIONDATE"),
                               "credit_period": b.get("BILLCREDITPERIOD")})

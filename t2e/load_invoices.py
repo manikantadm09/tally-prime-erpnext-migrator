@@ -497,7 +497,9 @@ class InvoiceLoader:
 
         The invoice posts to ERPNext's Receivable/Payable control. This paired JE
         immediately moves that party amount to the source Tally account/other
-        party control and references the invoice, leaving the final GL identical.
+        party control, leaving the final GL identical. It deliberately does not
+        reference the invoice: this row is a reclassification, not a payment,
+        and must not change invoice outstanding or aging.
         """
         key = f"{vrow['guid']}:party-control-bridge"
         existing = self.erp.find_by_field(
@@ -516,8 +518,6 @@ class InvoiceLoader:
             "account": target.account,
             "party_type": target.party_type,
             "party": target.party,
-            "reference_type": invoice_doctype,
-            "reference_name": invoice_name,
         }
         source_row = {"account": source.account}
         if source.kind == "party":

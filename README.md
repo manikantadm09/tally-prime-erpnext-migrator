@@ -129,15 +129,63 @@ outside the accounting-only scope (Godown, Cost Category, Tax Unit, and Voucher
 Type metadata) are explicitly marked skipped in staging instead of remaining
 misleadingly pending.
 
-Payment allocation is intentionally not applied by `run-all`. Review it as a
-separate operation because it uses FIFO within each party and can change many
-invoice/payment references without changing the GL:
+Payment allocation is intentionally not applied by `run-all`. The legacy
+`reconcile-payments` command uses FIFO within each party. FIFO can be useful as
+an explicitly approved ERPNext business policy, but it **does not reproduce
+Tally bill references** and can incorrectly mark deliberately open bills as
+paid. It must not be used for a Tally-fidelity migration. A live FIFO run now
+requires the additional `--acknowledge-non-tally-fifo` acknowledgement:
 
 ```powershell
 python -m t2e reconcile-payments
 # Inspect data/reports/payment_reconciliation.{json,csv} and obtain approval.
-python -m t2e reconcile-payments --confirm
+python -m t2e reconcile-payments --confirm --acknowledge-non-tally-fifo
 ```
+
+Party-control bridge Journal Entries are GL reclassifications, not payments.
+Current versions create them without invoice references. For a site migrated by
+an older version, inspect and unlink those references separately (dry-run first,
+then a single-document pilot using `--name`). This uses ERPNext's supported
+Unreconcile Payment workflow and does not cancel/repost historical accounting
+entries or alter debit/credit values:
+
+```powershell
+python -m t2e repair-party-bridges
+python -m t2e repair-party-bridges --name ACC-JV-YYYY-NNNNN --confirm
+```
+
+For bill-wise fidelity, export Tally's native outstanding reports, compare
+them with the submitted invoices, and build a source-reference plan:
+
+```powershell
+python -m tools.fetch_tally_native_report bills-receivable --from-date 20220101 --to-date 20260812
+python -m tools.fetch_tally_native_report bills-payable --from-date 20220101 --to-date 20260812
+python -m tools.verify_invoice_outstandings_api
+python -m tools.plan_exact_bill_allocations_api
+python -m t2e reconcile-exact-bills                 # full dry-run validation
+python -m t2e reconcile-exact-bills --party "Name" # recommended pilot
+python -m t2e reconcile-exact-bills --party "Name" --confirm
+python -m t2e reconcile-exact-bills --confirm       # reviewed remainder
+```
+
+The exact reconciler is bound to a fresh hashed verification report, validates
+live invoice/payment availability before every write, targets one named
+invoice/payment pair at a time, and verifies that active GL remains unchanged.
+It refuses Sales/Purchase Invoice rows as payment sources: ERPNext reconciles a
+return invoice by creating a same-control-account Journal Entry, which preserves
+balances but adds debit/credit turnover absent from Tally. Those cases are
+reported as `erpnext_return_reconciliation_turnover_exception` and intentionally
+remain open in ERPNext to preserve exact Trial Balance turnover. Negative
+differences where Tally's bill amount exceeds the underlying invoice GL are
+reported separately as `source_bill_vs_gl_exception`; never alter accounting
+entries merely to imitate such bill metadata.
+
+If a reviewed run was interrupted after ERPNext created return-reconciliation
+JEs, cancel them with `tools.revert_generated_return_reconciliations` and use
+the narrowly scoped server-side
+`tools/frappe_purge_generated_return_journals.py` after a fresh site backup to
+remove their immutable cancelled shells. Always run the purge without
+`--confirm` first and require identical active-GL signatures before/after.
 
 ## Repeat extraction and source changes
 
