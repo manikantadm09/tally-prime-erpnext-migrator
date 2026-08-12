@@ -174,11 +174,41 @@ invoice/payment pair at a time, and verifies that active GL remains unchanged.
 It refuses Sales/Purchase Invoice rows as payment sources: ERPNext reconciles a
 return invoice by creating a same-control-account Journal Entry, which preserves
 balances but adds debit/credit turnover absent from Tally. Those cases are
-reported as `erpnext_return_reconciliation_turnover_exception` and intentionally
-remain open in ERPNext to preserve exact Trial Balance turnover. Negative
+reported as `erpnext_return_reconciliation_turnover_exception`; do not feed
+them back into the ordinary exact reconciler. Negative
 differences where Tally's bill amount exceeds the underlying invoice GL are
 reported separately as `source_bill_vs_gl_exception`; never alter accounting
 entries merely to imitate such bill metadata.
+
+For the five proved Spaceki return documents, use the narrowly scoped
+server-side `tools/frappe_repair_return_bill_references.py`. It delinks the five
+self-referencing Payment Ledger rows, creates six exact Tally bill references
+(the shared ₹16,231 return is split as ₹124 + ₹16,107), and recalculates invoice
+status without creating GL Entries. It is plan-only by default, is bound to the
+exact company/documents/parties/accounts/before-and-after amounts, requires a
+real database backup for `--confirm`, and rolls back unless active GL and total
+Payment Ledger values remain unchanged:
+
+```bash
+# Run from the Frappe bench root with its Python.
+./env/bin/python /path/to/frappe_repair_return_bill_references.py \
+  --site dev.spaceki.com \
+  --company "Spaceki Designs LLP" \
+  --confirm-company "Spaceki Designs LLP"
+
+# Only after reviewing the plan and taking a fresh backup:
+./env/bin/python /path/to/frappe_repair_return_bill_references.py \
+  --site dev.spaceki.com \
+  --company "Spaceki Designs LLP" \
+  --confirm-company "Spaceki Designs LLP" \
+  --backup /apps/frappe-bench/sites/dev.spaceki.com/private/backups/FRESH-database.sql.gz \
+  --confirm --report /tmp/return_bill_reference_repair.json
+```
+
+After applying, rerun `tools.verify_invoice_outstandings_api`,
+`tools.audit_invoice_status_api`, and `tools.verify_financials_api`. The six
+return exceptions must disappear, ordinary overdue amounts must continue to
+match Tally, and the GL replay/signature must remain exact.
 
 If a reviewed run was interrupted after ERPNext created return-reconciliation
 JEs, cancel them with `tools.revert_generated_return_reconciliations` and use
