@@ -16,7 +16,9 @@ from t2e.approve_change import ApprovalError, approve, preview
 from t2e.load_invoices import (
     InvoiceLoader,
     _supplier_bill_no,
+    _tax_driven_place_of_supply,
     _taxes_as_invoice_items,
+    _apply_single_rate_item_gst,
     _unique_bill_no,
     _unique_transaction_name,
 )
@@ -25,7 +27,7 @@ from t2e.load_masters import (
     _insert_with_source_validation_fallback,
     _valid_gstin,
 )
-from t2e.ledger_fidelity import account_deltas
+from t2e.ledger_fidelity import account_deltas, effective_account_alias
 from t2e.load_period_closing import PeriodClosingLoader
 from t2e.load_vouchers import VoucherLoader
 from t2e.mapping import CompanyDefaults, Resolved
@@ -35,7 +37,11 @@ from t2e.staging import Staging
 from t2e.sync_report import build_report
 from t2e.tally_export import effective_from_date, extract_vouchers, stage_voucher_export
 from t2e.wipe import wipe
-from tools.verify_financials_api import source_postings, voucher_verification
+from tools.verify_financials_api import (
+    _target_balances,
+    source_postings,
+    voucher_verification,
+)
 from tools.audit_invoice_status_api import summarize as summarize_invoices
 
 
@@ -106,6 +112,35 @@ class NamingTests(unittest.TestCase):
 
 
 class InvoiceFidelityTests(unittest.TestCase):
+    def test_single_rate_gst_populates_item_breakup_exactly(self):
+        items = [
+            {"qty": 1, "rate": 3000},
+            {"qty": 1, "rate": 1000},
+        ]
+        taxes = [
+            {"description": "CGST INPUT @ 9 %", "account_head": "CGST",
+             "rate": 9, "tax_amount": 360},
+            {"description": "SGST INPUT @ 9 %", "account_head": "SGST",
+             "rate": 9, "tax_amount": 360},
+        ]
+        self.assertTrue(_apply_single_rate_item_gst(items, taxes))
+        self.assertEqual(sum(item["cgst_amount"] for item in items), 360)
+        self.assertEqual(sum(item["sgst_amount"] for item in items), 360)
+        self.assertEqual(items[0]["taxable_value"], 3000)
+        self.assertEqual(
+            json.loads(items[0]["item_tax_rate"]), {"CGST": 9.0, "SGST": 9.0})
+
+    def test_multi_rate_gst_stays_fail_closed(self):
+        items = [{"qty": 1, "rate": 1000}]
+        taxes = [
+            {"description": "CGST @ 9 %", "account_head": "CGST 9",
+             "rate": 9, "tax_amount": 90},
+            {"description": "CGST @ 2.5 %", "account_head": "CGST 2.5",
+             "rate": 2.5, "tax_amount": 25},
+        ]
+        self.assertFalse(_apply_single_rate_item_gst(items, taxes))
+        self.assertNotIn("cgst_amount", items[0])
+
     def test_invalid_source_gstin_fails_closed_without_mutating_dry_run(self):
         class ERP:
             dry_run = True
@@ -286,6 +321,38 @@ class InvoiceFidelityTests(unittest.TestCase):
         self.assertIn("TOWARDS PURCHASE", doc["items"][0]["description"])
         self.assertNotIn("_tally_manual_rounding", doc)
 
+    def test_place_of_supply_uses_explicit_state_not_party_gstin_state(self):
+        from t2e.load_invoices import _place_of_supply
+
+        # Supplier is registered in Tamil Nadu (33), but the transaction's
+        # place of supply is Karnataka (29).
+        self.assertEqual(
+            _place_of_supply("Karnataka", "33AABCM9798H1ZZ"),
+            "29-Karnataka",
+        )
+        self.assertEqual(
+            _place_of_supply("29-Karnataka", "33AABCM9798H1ZZ"),
+            "29-Karnataka",
+        )
+        self.assertEqual(
+            _place_of_supply("", "33AABCM9798H1ZZ"),
+            "33-Tamil Nadu",
+        )
+        self.assertEqual(
+            _tax_driven_place_of_supply(
+                "29-Karnataka", "33AABCM9798H1ZZ", "29ADYFS8460P1ZL",
+                ["IGST INPUT @ 18 %"],
+            ),
+            "33-Tamil Nadu",
+        )
+        self.assertEqual(
+            _tax_driven_place_of_supply(
+                "33-Tamil Nadu", "33AABCM9798H1ZZ", "29ADYFS8460P1ZL",
+                ["CGST @ 9 %", "SGST @ 9 %"],
+            ),
+            "29-Karnataka",
+        )
+
     def test_nonstandard_whole_rupee_round_is_preserved_manually(self):
         class ERP:
             dry_run = True
@@ -408,6 +475,19 @@ class InvoiceFidelityTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_effective_account_alias_is_date_scoped_and_suffixes_target(self):
+        aliases = {"IGST INPUT @ 18 %": {
+            "target": "Input Tax IGST", "effective_from": "2026-04-01"}}
+        self.assertIsNone(effective_account_alias(
+            aliases, "IGST INPUT @ 18 %", "2026-03-31", "SDL"))
+        self.assertEqual(
+            effective_account_alias(
+                aliases, "  igst input  @ 18 % ", "2026-04-01", "SDL"),
+            "Input Tax IGST - SDL",
+        )
+        self.assertIsNone(effective_account_alias(
+            aliases, "CGST Input", "2026-04-01", "SDL"))
+
     def test_tally_config_does_not_load_erp_secret_files(self):
         with patch(
                 "t2e.config._read_env",
@@ -564,6 +644,7 @@ class FinancialVerifierMappingTests(unittest.TestCase):
         with TemporaryStaging() as store:
             masters = [
                 ("sales-guid", "Sales Ledger", "Sales Ledger - OLD"),
+                ("igst-guid", "IGST INPUT @ 18 %", "IGST INPUT @ 18 % - OLD"),
                 ("round-guid", "ROUNDING OFF", "ROUNDING OFF - OLD"),
                 ("pl-guid", "Profit & Loss A/c", "Profit & Loss A/c - OLD"),
             ]
@@ -574,14 +655,23 @@ class FinancialVerifierMappingTests(unittest.TestCase):
                 "voucher-guid", "Journal", "1", "2026-04-01", None, 0,
                 {"ALLLEDGERENTRIES.LIST": [
                     {"LEDGERNAME": "Sales Ledger", "AMOUNT": "100"},
+                    {"LEDGERNAME": "IGST INPUT @ 18 %", "AMOUNT": "-18"},
                     {"LEDGERNAME": "ROUNDING OFF", "AMOUNT": "-1"},
-                    {"LEDGERNAME": "Profit & Loss A/c", "AMOUNT": "-99"},
+                    {"LEDGERNAME": "Profit & Loss A/c", "AMOUNT": "-81"},
                 ]},
             )
             account_meta = {
                 "Sales Ledger - TC": {
                     "account_name": "Sales Ledger", "is_group": 0,
                     "tally_guid": "sales-guid", "root_type": "Income",
+                },
+                "Input Tax IGST - TC": {
+                    "account_name": "Input Tax IGST", "is_group": 0,
+                    "tally_guid": None, "root_type": "Asset",
+                },
+                "IGST INPUT @ 18 % - TC": {
+                    "account_name": "IGST INPUT @ 18 %", "is_group": 0,
+                    "tally_guid": "igst-guid", "root_type": "Asset",
                 },
                 "Round Off - TC": {
                     "account_name": "Round Off", "is_group": 0,
@@ -609,6 +699,14 @@ class FinancialVerifierMappingTests(unittest.TestCase):
                     store.conn.execute("PRAGMA database_list").fetchone()[2]),
                 erpnext={
                     "retained_earnings_account": "Reserves and Surplus"},
+                yaml={
+                    "ledger_fidelity_account_aliases": {
+                        "IGST INPUT @ 18 %": {
+                            "target": "Input Tax IGST",
+                            "effective_from": "2026-04-01",
+                        },
+                    }
+                },
             )
             closing = {
                 "asset_account": "Closing Stock",
@@ -624,9 +722,28 @@ class FinancialVerifierMappingTests(unittest.TestCase):
 
             accounts = {row["ledger"]: row["account"] for row in postings}
             self.assertEqual(accounts["Sales Ledger"], "Sales Ledger - TC")
+            self.assertEqual(
+                accounts["IGST INPUT @ 18 %"], "IGST INPUT @ 18 % - TC")
             self.assertEqual(accounts["ROUNDING OFF"], "Round Off - TC")
             self.assertEqual(
                 accounts["Profit & Loss A/c"], "Reserves and Surplus - TC")
+
+    def test_target_balance_folds_date_effective_canonical_alias(self):
+        aliases = {"IGST INPUT @ 18 %": {
+            "target": "Input Tax IGST", "effective_from": "2026-04-01"}}
+        accounts, _ = _target_balances(
+            [
+                {"posting_date": "2026-03-31", "account": "Input Tax IGST - TC",
+                 "debit": 10, "credit": 0},
+                {"posting_date": "2026-04-01", "account": "Input Tax IGST - TC",
+                 "debit": 20, "credit": 0},
+                {"posting_date": "2026-04-01", "account": "IGST INPUT @ 18 % - TC",
+                 "debit": 30, "credit": 0},
+            ],
+            date(2026, 4, 1), aliases, "TC",
+        )
+        self.assertEqual(accounts["Input Tax IGST - TC"], Decimal("10.00"))
+        self.assertEqual(accounts["IGST INPUT @ 18 % - TC"], Decimal("50.00"))
 
 
 class InvoiceStatusAuditTests(unittest.TestCase):

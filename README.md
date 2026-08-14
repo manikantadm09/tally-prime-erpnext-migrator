@@ -120,6 +120,16 @@ accounts substituted by ERPNext/India Compliance. It must run before period
 closing. Run the default dry-run path first and take an ERPNext backup before
 using `--confirm`.
 
+When a compliance hook uses both a source-named account and a canonical ERPNext
+tax account, configure a date-effective equivalence in
+`ledger_fidelity_account_aliases`. The loader recognizes the canonical account
+only when the submitted base invoice actually used it; it does not globally
+remap historical postings. This prevents balance-neutral bridge JEs from
+inflating the standard Trial Balance Debit/Credit turnover while preserving the
+original account for invoices that still post there. Always verify the change
+with a dry run: `python -m t2e load-ledger-fidelity` must report `planned: 0`
+after an approved bridge cleanup.
+
 `load-masters` also rebinds staged ledger mappings to the current target
 company. This matters when the same staging database was first used on a local
 test company with a different abbreviation. It promotes only blank or
@@ -141,6 +151,45 @@ python -m t2e reconcile-payments
 # Inspect data/reports/payment_reconciliation.{json,csv} and obtain approval.
 python -m t2e reconcile-payments --confirm --acknowledge-non-tally-fifo
 ```
+
+When the source records a real payment as `Advance`, `On Account`, or an
+unlinked `New Ref`, use the evidence planner before considering any business-
+policy allocation. It accepts only mutually unique exact-amount matches for the
+same party, control account, and invoice direction; it never writes to ERPNext
+and explicitly identifies proposals that would disagree with Tally's native
+bill status:
+
+```powershell
+python -m tools.plan_evidence_payment_allocations `
+  data/reports/dev_spaceki_invoice_payment_state_current.json `
+  --staging data/staging.sqlite `
+  --verification data/reports/invoice_outstanding_verification.json `
+  --output data/reports/evidence_payment_allocation_plan.json
+```
+
+Do not treat equal amounts alone as payment proof. Review date proximity,
+party, account, Tally bill type, narration, and ambiguity. This command has no
+`--confirm` option; applying an approved plan is a separate, backup-gated step.
+
+Apply only one reviewed high-confidence pair at a time, starting with a pilot:
+
+```powershell
+python -m t2e reconcile-evidence-payment `
+  --payment ACC-PAY-2026-01519 --invoice PINV-26-02603
+# After a fresh ERPNext backup and review of the dry-run report:
+python -m t2e reconcile-evidence-payment `
+  --payment ACC-PAY-2026-01519 --invoice PINV-26-02603 `
+  --confirm --acknowledge-tally-bill-deviation
+```
+
+Pairs classified as `review` or `manual` stay blocked even when named. After
+document-level review and explicit approval, add
+`--acknowledge-weaker-evidence`; this does not relax the exact live amount,
+party/account, hashed-plan, Tally-deviation, or GL-invariance checks.
+
+The executor refreshes the live Payment Reconciliation state, refuses amount,
+party, account, plan-age, or source-report drift, exposes only the named pair to
+ERPNext, and requires active GL totals to remain unchanged.
 
 Party-control bridge Journal Entries are GL reclassifications, not payments.
 Current versions create them without invoice references. For a site migrated by
@@ -179,6 +228,44 @@ them back into the ordinary exact reconciler. Negative
 differences where Tally's bill amount exceeds the underlying invoice GL are
 reported separately as `source_bill_vs_gl_exception`; never alter accounting
 entries merely to imitate such bill metadata.
+
+If an earlier run allocated a real Payment Entry or Journal Entry to the wrong
+invoice, first generate a read-only unlink plan and review every named link:
+
+```powershell
+python tools/plan_tally_bill_unreconciliation_api.py
+python -m t2e unreconcile-tally-bill-mismatches
+```
+
+After a fresh database backup, apply only the unchanged, hash-bound plan:
+
+```powershell
+python -m t2e unreconcile-tally-bill-mismatches --confirm
+python tools/verify_invoice_outstandings_api.py
+python tools/plan_exact_bill_allocations_api.py --safe-subset
+python -m t2e reconcile-exact-bills              # dry run
+python -m t2e reconcile-exact-bills --confirm    # reviewed safe subset
+```
+
+The unreconciler uses ERPNext's supported Unreconcile Payment documents. It
+checks every live link and proves that active GL is unchanged. `--safe-subset`
+excludes a party when the available real settlement documents cannot fund the
+exact Tally bill references; it never creates an artificial payment merely to
+make an invoice show `Paid`.
+
+The final Spaceki verification matched 1,366 of 1,369 migrated invoice bill
+groups. Three native-source/model exceptions remain intentionally unchanged:
+
+- MEERA ONEIL NALAVADI: native Tally bill outstanding exceeds the complete
+  migrated invoice value by INR 2,431,247.
+- MAHENDRA HOMES PRIVATE LIMITED: native Tally bill outstanding exceeds its
+  complete migrated invoice value by INR 639,576.
+- STRONGLASS TOUGH: native Tally bill references require INR 36,000 more
+  settlement capacity than all real ERPNext payment documents provide.
+
+These exceptions do not affect the exact voucher GL replay, Trial Balance,
+Profit and Loss, or customer/supplier control totals. They require client-side
+source clarification, not a fabricated ERPNext accounting transaction.
 
 For the five proved Spaceki return documents, use the narrowly scoped
 server-side `tools/frappe_repair_return_bill_references.py`. It delinks the five
@@ -281,6 +368,49 @@ Liabilities to the asset side and display the current loss as `Profit & Loss
 A/c`; ERPNext shows the same current loss as Provisional Profit/Loss. Compare
 the underlying ledger balances and the accounting equation, not only the four
 dashboard cards.
+
+For final sign-off, run both verification layers:
+
+```powershell
+python tools/verify_financials_api.py
+python tools/verify_invoice_outstandings_api.py
+python tools/verify_native_financial_reports_api.py
+```
+
+`verify_native_financial_reports_api.py` compares native Tally exports with
+the ERPNext report APIs for every migrated fiscal period. A result of
+`DATA_EQUIVALENT_REPORT_PRESENTATION_DIFFERS` means voucher values, ledger
+balances, Profit and Loss, and both accounting equations are exact, while the
+two products arrange negative groups or provisional profit/loss differently
+on the Balance Sheet.
+
+Cancelled migration artifacts may be physically removed only after a fresh
+full site backup and a plan proving that every cancelled parent has a submitted
+replacement. Use `tools/frappe_purge_cancelled_non_invoices.py` on the server:
+it is plan-only unless supplied its exact generated deletion phrase, deletes
+only inactive derived rows belonging to the named cancelled parents, and rolls
+back unless submitted counts and the active-GL signature remain unchanged.
+
+If the GST amount audit is correct but source `place_of_supply` metadata differs
+on submitted invoices, use the separate metadata-only repair. It changes no
+tax rows, totals, payment allocations, status, or GL values:
+
+```bash
+# Generate the source-bound audit from the migration workstation first.
+python tools/audit_invoice_tax_structure_api.py \
+  --company "Spaceki Designs LLP" --output /tmp/invoice_tax_audit.json
+
+# On the Frappe server, preview the exact drift first.
+./env/bin/python /tmp/frappe_repair_invoice_place_of_supply.py \
+  --site dev.spaceki.com --company "Spaceki Designs LLP" \
+  --confirm-company "Spaceki Designs LLP" \
+  --manifest /tmp/invoice_tax_audit.json --expected-count 15 \
+  --report /tmp/place_of_supply_plan.json
+```
+
+Apply only after taking a fresh database backup and only when the plan count is
+the reviewed count. The repair fails if the invoice GUID, current place of
+supply, totals, outstanding amount, status, or active GL signature has drifted.
 
 ## Development
 

@@ -33,6 +33,14 @@ erpnext:
   rounding_account: "Round Off"
   batch_size: 50                   # docs per REST batch where batching is used
 
+# Date-effective account substitutions made by ERPNext/installed compliance
+# apps. Ledger-fidelity treats these postings as equivalent instead of creating
+# balanced reclassification JEs that inflate Trial Balance debit/credit.
+ledger_fidelity_account_aliases:
+  "IGST INPUT @ 18 %":
+    target: "Input Tax IGST"
+    effective_from: "2026-04-01"
+
 # Custom field added to every migrated doctype so the migration is idempotent
 # and reversible. Stores the Tally GUID of the source master/voucher.
 idempotency_field: "tally_guid"

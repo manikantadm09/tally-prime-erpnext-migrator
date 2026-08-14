@@ -18,6 +18,7 @@ from xml.etree import ElementTree as ET
 from t2e.config import get_config
 from t2e.erpnext_client import ERPNextClient
 from t2e.lines import is_round_ledger
+from t2e.ledger_fidelity import effective_account_alias
 from t2e.load_masters import fetch_company_defaults
 from t2e.mapping import GroupTree, acc_name
 from t2e.staging import Staging
@@ -680,7 +681,9 @@ def voucher_verification(
 
 
 def _target_balances(
-    gl: list[dict[str, Any]], as_of: date
+    gl: list[dict[str, Any]], as_of: date,
+    account_aliases: dict | None = None,
+    abbr: str = "",
 ) -> tuple[dict[str, Decimal], dict[tuple[str, str], Decimal]]:
     accounts: dict[str, Decimal] = defaultdict(lambda: Decimal("0.00"))
     parties: dict[tuple[str, str], Decimal] = defaultdict(
@@ -688,10 +691,18 @@ def _target_balances(
     )
     cutoff = as_of.isoformat()
     for entry in gl:
-        if str(entry["posting_date"]) > cutoff:
+        posting_date = str(entry["posting_date"])
+        if posting_date > cutoff:
             continue
         value = money(entry.get("debit")) - money(entry.get("credit"))
-        accounts[entry["account"]] += value
+        account = entry["account"]
+        for source_name, spec in (account_aliases or {}).items():
+            target = effective_account_alias(
+                {source_name: spec}, source_name, posting_date, abbr)
+            if target and account == target:
+                account = acc_name(source_name, abbr)
+                break
+        accounts[account] += value
         if entry.get("party_type") and entry.get("party"):
             parties[(entry["party_type"], entry["party"])] += value
     return accounts, parties
@@ -913,7 +924,9 @@ def main() -> None:
     for as_of in dates:
         print(f"Comparing Trial Balance at {as_of} ...")
         target_accounts, target_parties = _target_balances(
-            erp_data["gl"], as_of
+            erp_data["gl"], as_of,
+            cfg.yaml.get("ledger_fidelity_account_aliases", {}),
+            defaults.abbr,
         )
         summary, detail = trial_balance_from_postings(
             postings, target_accounts, target_parties, as_of
@@ -942,7 +955,9 @@ def main() -> None:
         )
 
     current_accounts, current_parties = _target_balances(
-        erp_data["gl"], latest
+        erp_data["gl"], latest,
+        cfg.yaml.get("ledger_fidelity_account_aliases", {}),
+        defaults.abbr,
     )
     source_party = {"Customer": Decimal("0.00"), "Supplier": Decimal("0.00")}
     for posting in postings:

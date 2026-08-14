@@ -21,6 +21,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
+import json
 import re
 import urllib.parse
 
@@ -626,6 +627,75 @@ def _tax_rate(ledger: str) -> float:
     return float(match.group(1) or match.group(2))
 
 
+def _gst_kind(value: str) -> str | None:
+    text = _norm(value).casefold()
+    for kind in ("cgst", "sgst", "igst", "cess"):
+        if kind in text:
+            return kind
+    return None
+
+
+def _allocate_money(total: Decimal, weights: list[Decimal]) -> list[Decimal]:
+    denominator = sum(weights, Decimal("0.00"))
+    if not denominator:
+        return []
+    result, remaining = [], total
+    for index, weight in enumerate(weights):
+        if index == len(weights) - 1:
+            value = remaining
+        else:
+            value = (total * weight / denominator).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+            remaining -= value
+        result.append(value)
+    return result
+
+
+def _apply_single_rate_item_gst(items: list[dict], taxes: list[dict]) -> bool:
+    """Populate item GST fields only when source rates are unambiguous."""
+    grouped: dict[str, list[dict]] = {}
+    for tax in taxes:
+        kind = _gst_kind(tax.get("description") or tax.get("account_head"))
+        if kind:
+            grouped.setdefault(kind, []).append(tax)
+    if not grouped or not items:
+        return False
+    # One source ledger/rate per GST kind is safe. Multiple rates need the
+    # dedicated splitter because a generic ledger item cannot identify which
+    # taxable base belongs to which rate.
+    if any(
+        len(rows) != 1 or float(rows[0].get("rate") or 0) <= 0
+        for rows in grouped.values()
+    ):
+        return False
+    weights = [
+        abs(Decimal(str(item.get("qty") or 0))
+            * Decimal(str(item.get("rate") or 0)))
+        for item in items
+    ]
+    if not sum(weights, Decimal("0.00")):
+        return False
+    account_rates = {
+        rows[0]["account_head"]: float(rows[0]["rate"])
+        for rows in grouped.values()
+    }
+    allocations = {
+        kind: _allocate_money(
+            Decimal(str(rows[0]["tax_amount"])).quantize(Decimal("0.01")),
+            weights,
+        )
+        for kind, rows in grouped.items()
+    }
+    for index, item in enumerate(items):
+        item["gst_treatment"] = "Taxable"
+        item["taxable_value"] = float(weights[index])
+        item["item_tax_rate"] = json.dumps(account_rates, sort_keys=True)
+        for kind, rows in grouped.items():
+            item[f"{kind}_rate"] = float(rows[0]["rate"])
+            item[f"{kind}_amount"] = float(allocations[kind][index])
+    return True
+
+
 def _tally_date(value) -> str | None:
     raw = _scalar(value)
     if len(raw) == 8 and raw.isdigit():
@@ -661,11 +731,55 @@ _GST_STATE_BY_CODE = {
 
 
 def _place_of_supply(state: str, gstin: str) -> str:
-    code = gstin[:2] if len(gstin) >= 2 and gstin[:2].isdigit() else ""
-    name = state or _GST_STATE_BY_CODE.get(code, "")
-    if code and name:
-        return f"{code}-{name}"
-    return name
+    """Return a valid GST ``NN-State`` place-of-supply value.
+
+    The party GSTIN identifies the party's registration state, which can differ
+    from the transaction's place of supply.  Prefer Tally's explicit state and
+    derive that state's code.  Use the GSTIN only when no state was supplied.
+    """
+    raw_state = _scalar(state).strip()
+    prefixed = re.fullmatch(r"(\d{2})\s*-\s*(.+)", raw_state)
+    if prefixed:
+        code, supplied_name = prefixed.groups()
+        canonical = _GST_STATE_BY_CODE.get(code)
+        if canonical and _norm(canonical).casefold() == _norm(supplied_name).casefold():
+            return f"{code}-{canonical}"
+        raw_state = supplied_name.strip()
+
+    aliases = {
+        "orissa": "Odisha",
+        "pondicherry": "Puducherry",
+        "jammu & kashmir": "Jammu and Kashmir",
+        "andaman & nicobar islands": "Andaman and Nicobar Islands",
+    }
+    state_name = aliases.get(raw_state.casefold(), raw_state)
+    if state_name:
+        for code, canonical in _GST_STATE_BY_CODE.items():
+            if _norm(canonical).casefold() == _norm(state_name).casefold():
+                return f"{code}-{canonical}"
+        return state_name
+
+    gstin_code = gstin[:2] if len(gstin) >= 2 and gstin[:2].isdigit() else ""
+    gstin_state = _GST_STATE_BY_CODE.get(gstin_code, "")
+    return f"{gstin_code}-{gstin_state}" if gstin_state else ""
+
+
+def _tax_driven_place_of_supply(place: str, party_gstin: str,
+                                company_gstin: str,
+                                tax_ledgers: list[str]) -> str:
+    """Resolve target POS from the GST ledgers actually posted in Tally.
+
+    ERPNext/India Compliance uses this field to decide IGST vs CGST/SGST. On a
+    purchase Tally's text can identify the delivery/company state even though
+    the supplier-to-destination supply is interstate. The tax ledger is the
+    stronger accounting evidence in that conflict.
+    """
+    kinds = {_gst_kind(ledger) for ledger in tax_ledgers}
+    if "igst" in kinds and party_gstin:
+        return _place_of_supply("", party_gstin) or place
+    if kinds & {"cgst", "sgst"} and company_gstin:
+        return _place_of_supply("", company_gstin) or place
+    return place
 
 
 def _same_posting_target(source: Resolved | None,

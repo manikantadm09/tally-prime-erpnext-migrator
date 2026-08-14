@@ -8,7 +8,13 @@ from typing import Any
 import yaml
 from dotenv import dotenv_values
 
-ROOT = Path(__file__).resolve().parent.parent
+# Keep code and runtime data separable.  Production uses the reviewed canonical
+# package from this repository while credentials, config, staging and reports
+# remain in a dedicated (gitignored) run directory.  The override is evaluated
+# at process start, before Config is constructed.
+ROOT = Path(
+    os.environ.get("T2E_RUNTIME_ROOT", Path(__file__).resolve().parent.parent)
+).expanduser().resolve()
 DATA_DIR = ROOT / "data"
 
 

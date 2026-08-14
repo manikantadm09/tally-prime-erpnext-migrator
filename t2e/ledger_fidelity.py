@@ -24,6 +24,26 @@ MIGRATED_DOCTYPES = (
 )
 
 
+def effective_account_alias(aliases: dict, ledger_name: str, posting_date: str,
+                            abbr: str) -> str | None:
+    """Resolve a date-effective source ledger to its canonical target leaf."""
+    normalized = " ".join((ledger_name or "").split()).casefold()
+    spec = next(
+        (value for key, value in (aliases or {}).items()
+         if " ".join(str(key).split()).casefold() == normalized),
+        None,
+    )
+    if not isinstance(spec, dict) or not spec.get("target"):
+        return None
+    effective_from = str(spec.get("effective_from") or "0001-01-01")
+    effective_to = str(spec.get("effective_to") or "9999-12-31")
+    if not effective_from <= str(posting_date) <= effective_to:
+        return None
+    target = " ".join(str(spec["target"]).split())
+    suffix = f" - {abbr}"
+    return target if target.endswith(suffix) else f"{target}{suffix}"
+
+
 def _money(value) -> Decimal:
     return Decimal(str(value or 0)).quantize(PENNY, rounding=ROUND_HALF_UP)
 
@@ -47,7 +67,7 @@ class LedgerFidelityLoader:
         self.resolver = resolver
         self.cfg = get_config()
 
-    def _plans(self):
+    def _plans(self, only_guids: set[str] | None = None):
         company = self.defaults.name
         accounts = self.erp.get_list(
             "Account",
@@ -97,11 +117,17 @@ class LedgerFidelityLoader:
             row for row in self.store.vouchers()
             if row["load_status"] == "loaded"
             and row["erp_doctype"] in ("Sales Invoice", "Purchase Invoice")
+            and (not only_guids or row["guid"] in only_guids)
         ]
         plans = []
         for row in invoice_rows:
             guid = row["guid"]
             bridge_tag = f"{guid}:ledger-fidelity-bridge"
+            base_actual_accounts = {
+                gl["account"]
+                for name in by_tag.get(guid, [])
+                for gl in gl_by_document.get(name, [])
+            }
             desired = defaultdict(lambda: Decimal("0.00"))
             for entry in parse_entries(json.loads(row["payload"])):
                 resolved = self.resolver.get(entry["ledger"])
@@ -109,8 +135,25 @@ class LedgerFidelityLoader:
                     raise ERPNextError(
                         f"Ledger-fidelity source is unresolved for {guid}: "
                         f"{entry['ledger']}")
+                alias = effective_account_alias(
+                    self.cfg.yaml.get("ledger_fidelity_account_aliases", {}),
+                    entry["ledger"], row["vdate"], self.defaults.abbr,
+                )
+                # Compliance hooks are not perfectly uniform: some invoices
+                # use the canonical tax account while others retain the source
+                # ledger. Treat the alias as equivalent only when the submitted
+                # base document actually used it.
+                account = (
+                    alias if alias and canonical(alias) in base_actual_accounts
+                    else resolved.account
+                )
+                account = canonical(account)
+                if account not in canonical_account.values():
+                    raise ERPNextError(
+                        f"Ledger-fidelity alias target is absent for {guid}: "
+                        f"{entry['ledger']} -> {account}")
                 key = (
-                    canonical(resolved.account),
+                    account,
                     resolved.party_type if resolved.kind == "party" else None,
                     resolved.party if resolved.kind == "party" else None,
                 )
@@ -138,8 +181,9 @@ class LedgerFidelityLoader:
             plans.append((row, bridge_tag, deltas))
         return invoice_rows, plans
 
-    def run(self, progress=lambda *args: None) -> dict[str, int]:
-        invoice_rows, plans = self._plans()
+    def run(self, progress=lambda *args: None,
+            only_guids: set[str] | None = None) -> dict[str, int]:
+        invoice_rows, plans = self._plans(only_guids=only_guids)
         stats = {
             "checked": len(invoice_rows),
             "planned": len(plans) if self.erp.dry_run else 0,

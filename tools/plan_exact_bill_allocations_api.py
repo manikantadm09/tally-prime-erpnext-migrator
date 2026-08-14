@@ -7,6 +7,7 @@ selected by FIFO. The input is the fresh Tally-vs-ERPNext outstanding report.
 from __future__ import annotations
 
 from collections import defaultdict
+import argparse
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
@@ -125,6 +126,16 @@ def distribute_reduction(group: dict, invoice_by_name: dict[str, dict]) -> list[
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--safe-subset",
+        action="store_true",
+        help=(
+            "exclude parties whose exact Tally target cannot be funded from "
+            "current ERPNext payment rows; exclusions remain explicit in the plan"
+        ),
+    )
+    args = parser.parse_args()
     cfg = get_config()
     report_dir = cfg.staging_db.parent / "reports"
     verification_path = report_dir / "invoice_outstanding_verification.json"
@@ -397,6 +408,24 @@ def main() -> None:
         if party_row["targets"] or party_row["errors"]:
             actionable_parties.append(party_row)
     parties = actionable_parties
+    excluded_residual_parties = []
+    if args.safe_subset:
+        retained = []
+        for row in parties:
+            if money(row["residual"]) or row["errors"]:
+                excluded_residual_parties.append({
+                    "party_type": row["party_type"],
+                    "party": row["party"],
+                    "required": row["required"],
+                    "planned": row["planned"],
+                    "residual": row["residual"],
+                    "targets": sorted(row["targets"]),
+                    "errors": row["errors"],
+                    "reason": "insufficient current ERPNext payment availability",
+                })
+            else:
+                retained.append(row)
+        parties = retained
     total_required = sum((money(row["required"]) for row in parties), Decimal("0.00"))
     total_planned = sum((money(row["planned"]) for row in parties), Decimal("0.00"))
     total_residual = total_required - total_planned
@@ -418,6 +447,8 @@ def main() -> None:
             len(excluded_return_groups) + len(dynamically_excluded_returns)),
         "excluded_return_reconciliation_amount": f"{excluded_return_amount:.2f}",
         "excluded_return_reconciliation_details": dynamically_excluded_returns,
+        "safe_subset": args.safe_subset,
+        "excluded_residual_parties": excluded_residual_parties,
         "parties": len(parties),
         "required": f"{total_required:.2f}",
         "planned": f"{total_planned:.2f}",

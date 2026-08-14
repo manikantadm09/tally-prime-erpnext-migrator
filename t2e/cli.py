@@ -12,6 +12,7 @@ All write operations are DRY-RUN unless --confirm is passed.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from .config import get_config
@@ -85,6 +86,41 @@ def cmd_approve_change(args) -> int:
         rc = 1
     s.close()
     return rc
+
+
+def cmd_repair_fallback_invoice(args) -> int:
+    """Replace one or more fallback JEs only after exact GL equivalence."""
+    from .repair_fallback_invoices import FallbackRepairError, repair_one
+    erp, store = ERPNextClient(dry_run=not args.confirm), Staging()
+    _banner(erp.dry_run)
+    results = []
+    failed = False
+    def json_safe(value):
+        if isinstance(value, dict):
+            return {str(key): json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [json_safe(item) for item in value]
+        return value
+    for guid in args.guid:
+        try:
+            result = repair_one(
+                erp, store, guid, get_config().idempotency_field,
+                phase=args.phase,
+                neutralize_target_gst=args.neutralize_target_gst,
+                acknowledge_invalid_source_gstin=
+                    args.acknowledge_invalid_source_gstin)
+            results.append(result)
+            print(json.dumps(json_safe(result), indent=2, default=str))
+        except (FallbackRepairError, Exception) as exc:
+            # Keep processing an explicitly supplied batch. Each record is
+            # independently fail-closed and reports its own evidence.
+            failed = True
+            print(f"  ! {guid}: {exc}", file=sys.stderr)
+            if args.debug:
+                import traceback
+                traceback.print_exc()
+    store.close()
+    return 1 if failed else 0
 
 
 def cmd_sync_report(args) -> int:
@@ -190,7 +226,7 @@ def cmd_load_ledger_fidelity(args) -> int:
 
     def prog(i, total, stats):
         print(f"  {i}/{total} created={stats['created']} error={stats['error']}")
-    stats = loader.run(progress=prog)
+    stats = loader.run(progress=prog, only_guids=set(args.guid or []))
     print("  ledger fidelity:", stats)
     if erp.dry_run and stats["planned"]:
         print("  -> run before load-period-closing; review, then pass --confirm")
@@ -316,6 +352,42 @@ def cmd_reconcile_exact_bills(args) -> int:
         print(f"  {row.get('party_type', '')} {row.get('party', '')}: "
               f"{row['status']} allocations={row.get('allocations', 0)} "
               f"amount={row.get('allocated', '0.00')}")
+    print(f"  -> report: {payload['report']}")
+    return 0
+
+
+def cmd_unreconcile_tally_bill_mismatches(args) -> int:
+    from pathlib import Path
+    from .tally_bill_unreconciliation import TallyBillUnreconciler
+    cfg = get_config()
+    erp = ERPNextClient(dry_run=not args.confirm)
+    _banner(erp.dry_run)
+    plan = Path(args.plan) if args.plan else (
+        cfg.staging_db.parent / "reports" /
+        "tally_bill_unreconciliation_plan.json")
+    payload = TallyBillUnreconciler(erp, plan).run()
+    print(f"  Tally bill reset: pairs={payload['pairs']} "
+          f"mode={payload['mode']} pass={payload['pass']}")
+    print(f"  -> report: {payload['report']}")
+    return 0
+
+
+def cmd_reconcile_evidence_payment(args) -> int:
+    from pathlib import Path
+    from .evidence_payment_reconciliation import EvidencePaymentReconciler
+    cfg = get_config()
+    erp = ERPNextClient(dry_run=not args.confirm)
+    _banner(erp.dry_run)
+    plan = Path(args.plan) if args.plan else (
+        cfg.staging_db.parent / "reports" / "evidence_payment_allocation_plan.json")
+    reconciler = EvidencePaymentReconciler(erp, plan)
+    payload = reconciler.run(
+        args.payment, args.invoice,
+        acknowledge_tally_deviation=args.acknowledge_tally_bill_deviation,
+        acknowledge_weaker_evidence=args.acknowledge_weaker_evidence,
+    )
+    print(f"  evidence payment reconciliation: {args.payment} -> {args.invoice} "
+          f"mode={payload['mode']} pass={payload['pass']}")
     print(f"  -> report: {payload['report']}")
     return 0
 
@@ -511,6 +583,28 @@ def main(argv=None) -> int:
              "a Period Closing Voucher")
     ac.set_defaults(func=cmd_approve_change)
 
+    rf = sub.add_parser(
+        "repair-fallback-invoice",
+        help="replace invoice-shaped fallback JEs with GL-equivalent invoices")
+    rf.add_argument("--guid", action="append", required=True,
+                    help="exact Tally GUID (repeatable)")
+    rf.add_argument("--confirm", action="store_true", help="execute writes")
+    rf.add_argument(
+        "--phase", choices=("full", "prepare", "finalize"), default="full",
+        help="prepare keeps the source JE active for server-side GST metadata; "
+             "finalize verifies it and then cancels the source JE")
+    rf.add_argument("--debug", action="store_true",
+                    help="print a traceback for a failed guarded repair")
+    rf.add_argument(
+        "--neutralize-target-gst", action="store_true",
+        help="prepare with company-state POS to prevent target tax rewriting; "
+             "requires server-side POS/GST metadata restoration before finalize")
+    rf.add_argument(
+        "--acknowledge-invalid-source-gstin", action="store_true",
+        help="explicitly omit a checksum-invalid Tally GSTIN from ERPNext GSTIN "
+             "fields while preserving the exact source value in invoice remarks")
+    rf.set_defaults(func=cmd_repair_fallback_invoice)
+
     for name, func in [("load-masters", cmd_load_masters), ("wipe", cmd_wipe),
                        ("run-all", cmd_run_all)]:
         sp = sub.add_parser(name)
@@ -567,11 +661,38 @@ def main(argv=None) -> int:
                     help="plan JSON (default: data/reports/exact_bill_allocation_plan.json)")
     eb.set_defaults(func=cmd_reconcile_exact_bills)
 
+    ub = sub.add_parser(
+        "unreconcile-tally-bill-mismatches",
+        help="unlink reviewed payment/invoice pairs contradicted by Tally bills")
+    ub.add_argument("--confirm", action="store_true",
+                    help="submit standard Unreconcile Payment documents")
+    ub.add_argument("--plan", default=None,
+                    help="plan JSON (default: data/reports/tally_bill_unreconciliation_plan.json)")
+    ub.set_defaults(func=cmd_unreconcile_tally_bill_mismatches)
+
+    ep = sub.add_parser(
+        "reconcile-evidence-payment",
+        help="apply one reviewed exact payment/invoice evidence pair")
+    ep.add_argument("--confirm", action="store_true", help="execute reconciliation")
+    ep.add_argument("--payment", required=True, help="exact Payment Entry name")
+    ep.add_argument("--invoice", required=True, help="exact Sales/Purchase Invoice name")
+    ep.add_argument("--plan", default=None,
+                    help="evidence plan JSON (default: data/reports/evidence_payment_allocation_plan.json)")
+    ep.add_argument(
+        "--acknowledge-tally-bill-deviation", action="store_true",
+        help="required with --confirm when the reviewed link changes Tally bill-wise status")
+    ep.add_argument(
+        "--acknowledge-weaker-evidence", action="store_true",
+        help="required for an explicitly reviewed review/manual-confidence pair")
+    ep.set_defaults(func=cmd_reconcile_evidence_payment)
+
     lf = sub.add_parser(
         "load-ledger-fidelity",
         help="reclass ERPNext/India Compliance substituted invoice accounts "
              "back to exact mapped Tally ledgers")
     lf.add_argument("--confirm", action="store_true", help="execute writes")
+    lf.add_argument("--guid", action="append",
+                    help="limit to this exact staged Tally GUID (repeatable)")
     lf.set_defaults(func=cmd_load_ledger_fidelity)
 
     cs = sub.add_parser("load-closing-stock",
