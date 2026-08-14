@@ -412,6 +412,23 @@ Apply only after taking a fresh database backup and only when the plan count is
 the reviewed count. The repair fails if the invoice GUID, current place of
 supply, totals, outstanding amount, status, or active GL signature has drifted.
 
+Historical Tally data can also use multiple rate-specific GST ledgers while
+India Compliance GST Settings permits only one default Input and Output account
+set. Do not replace migrated account heads merely to silence the invoice form
+warning. Instead, audit and backfill the source-derived `gst_tax_type` metadata
+on submitted tax rows; this preserves Tally ledger fidelity and makes GST
+validation/reporting recognize the historical rows:
+
+```powershell
+python tools/audit_invoice_tax_structure_api.py `
+  --company "Spaceki Designs LLP" --output data/reports/invoice_tax_audit.json
+```
+
+Run `tools/frappe_repair_invoice_gst_tax_types.py` on the Frappe server in
+plan-only mode first. Its confirm mode requires a fresh database backup and
+updates only `gst_tax_type`; it verifies every invoice identity and tax-row
+amount and proves the active GL signature is unchanged.
+
 ## Development
 
 ```powershell

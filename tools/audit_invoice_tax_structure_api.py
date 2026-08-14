@@ -81,6 +81,34 @@ def actual_gst_breakup(doc: dict) -> dict[str, Decimal]:
     }
 
 
+def gst_tax_type_rows(doc: dict) -> list[dict]:
+    rows = []
+    for row in doc.get("taxes") or []:
+        amount = money(row.get("tax_amount"))
+        kind = gst_kind(row.get("description") or row.get("account_head"))
+        if not kind or not amount:
+            continue
+        rows.append({
+            "account_head": row.get("account_head") or "",
+            "description": row.get("description") or "",
+            "amount": f"{amount:.2f}",
+            "expected_gst_tax_type": kind.lower(),
+            "actual_gst_tax_type": row.get("gst_tax_type") or "",
+        })
+    return rows
+
+
+def gst_tax_type_classification(rows: list[dict]) -> str:
+    if not rows:
+        return "no_gst_tax_rows"
+    if all(row["actual_gst_tax_type"].casefold() == row["expected_gst_tax_type"]
+           for row in rows):
+        return "correct"
+    if all(not row["actual_gst_tax_type"] for row in rows):
+        return "missing"
+    return "mismatch"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--company", required=True)
@@ -162,6 +190,7 @@ def main() -> int:
             breakup_classification = "zero"
         else:
             breakup_classification = "mismatch"
+        tax_type_rows = gst_tax_type_rows(doc)
         if actual == expected and not items:
             classification = "correct_tax_rows"
         elif items == expected and not actual:
@@ -181,6 +210,7 @@ def main() -> int:
             "actual_place_of_supply": doc.get("place_of_supply") or "",
             "classification": classification,
             "gst_breakup_classification": breakup_classification,
+            "gst_tax_type_classification": gst_tax_type_classification(tax_type_rows),
             "expected_gst_breakup": {
                 key: f"{value:.2f}" for key, value in expected_breakup.items()
             },
@@ -195,6 +225,7 @@ def main() -> int:
                 {"ledger": name, "amount": f"{amount:.2f}", "count": count}
                 for (name, amount), count in actual.items()
             ],
+            "gst_tax_type_rows": tax_type_rows,
             "tax_item_rows": [
                 {"ledger": name, "amount": f"{amount:.2f}", "count": count}
                 for (name, amount), count in items.items()
@@ -216,6 +247,10 @@ def main() -> int:
         for row in details
         if row.get("expected_place_of_supply") is not None
     )
+    tax_type_counts = Counter(
+        row["gst_tax_type_classification"] for row in details
+        if row.get("gst_tax_type_classification")
+    )
     payload = {
         "company": args.company,
         "mode": "read-only",
@@ -223,6 +258,7 @@ def main() -> int:
         "classifications": dict(sorted(counts.items())),
         "gst_breakup_classifications": dict(sorted(breakup_counts.items())),
         "place_of_supply_classifications": dict(sorted(place_counts.items())),
+        "gst_tax_type_classifications": dict(sorted(tax_type_counts.items())),
         "details": details,
     }
     output = Path(args.output).resolve()
