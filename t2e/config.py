@@ -29,7 +29,7 @@ def _read_env(name: str) -> dict[str, str]:
 # Env files carry both PRD_ and DEV_ prefixed variables so one checkout can target
 # either server. We pick the active environment's set and strip the prefix, so the
 # rest of the code reads plain names (ERPNEXT_URL, ERPNEXT_DB_HOST, ...).
-_KNOWN_ENVS = ("PRD", "DEV")
+_KNOWN_ENVS = ("PRD", "DEV", "UAT")
 _ENV_OVERRIDE: str | None = None
 
 
@@ -47,11 +47,18 @@ def _select_prefixed(d: dict[str, str], env: str, fname: str) -> dict[str, str]:
     sel = {k[len(prefix):]: v for k, v in d.items() if k.startswith(prefix)}
     if sel:
         return sel
-    # Legacy (unprefixed) file: only accept it if it carries no env prefixes at all.
-    if any(k.split("_", 1)[0] in _KNOWN_ENVS for k in d):
-        avail = sorted({k.split("_", 1)[0] for k in d if k.split("_", 1)[0] in _KNOWN_ENVS})
-        raise KeyError(f"No '{prefix}' variables in {fname}; available: {avail}")
-    return d
+    # Unprefixed keys are the frozen-dev/legacy target. Other env prefixes
+    # (e.g. UAT_) may coexist in the same gitignored file.
+    unprefixed = {
+        k: v for k, v in d.items()
+        if k.split("_", 1)[0] not in _KNOWN_ENVS
+    }
+    if unprefixed:
+        return unprefixed
+    avail = sorted({
+        k.split("_", 1)[0] for k in d if k.split("_", 1)[0] in _KNOWN_ENVS
+    })
+    raise KeyError(f"No '{prefix}' variables in {fname}; available: {avail}")
 
 
 class Config:
@@ -88,7 +95,11 @@ class Config:
     # ---- convenience accessors -------------------------------------------
     @property
     def tally(self) -> dict[str, Any]:
-        return self.yaml["tally"]
+        data = dict(self.yaml["tally"])
+        url = os.environ.get("TALLY_URL")
+        if url:
+            data["url"] = url.rstrip("/")
+        return data
 
     @property
     def erpnext(self) -> dict[str, Any]:

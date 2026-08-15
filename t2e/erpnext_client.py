@@ -8,9 +8,11 @@ user passes ``--confirm``.
 from __future__ import annotations
 
 import json
+import socket
 import time
 import urllib.parse
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -24,10 +26,38 @@ class ERPNextError(RuntimeError):
         self.body = body
 
 
+_FORBIDDEN_UAT_HOSTS = {
+    "dev.spaceki.com",
+    "erp.spaceki.com",
+    "spacekierpnext",
+}
+
+
+def _erp_base_and_host(url: str) -> tuple[str, str | None]:
+    """Keep the site Host header even when *.local does not resolve."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    base = url.rstrip("/")
+    if not host:
+        return base, None
+    try:
+        socket.getaddrinfo(host, parsed.port or 80)
+        return base, None
+    except socket.gaierror:
+        netloc = f"127.0.0.1:{parsed.port}" if parsed.port else "127.0.0.1"
+        rewritten = parsed._replace(netloc=netloc).geturl().rstrip("/")
+        return rewritten, host
+
+
 class ERPNextClient:
     def __init__(self, dry_run: bool = True) -> None:
         cfg = get_config()
-        self.base = cfg.erp_url
+        host = (urlparse(cfg.erp_url).hostname or "").lower()
+        if cfg.env_name == "UAT" and (
+                host in _FORBIDDEN_UAT_HOSTS or host.endswith(".spaceki.com")):
+            raise ERPNextError(
+                f"UAT environment refuses frozen/production host {host}")
+        self.base, extra_host = _erp_base_and_host(cfg.erp_url)
         self.dry_run = dry_run
         self.session = requests.Session()
         self.session.headers.update({
@@ -35,6 +65,8 @@ class ERPNextClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
+        if extra_host:
+            self.session.headers["Host"] = extra_host
         self.session.verify = cfg.erp_verify_ssl
         if not cfg.erp_verify_ssl:
             import urllib3

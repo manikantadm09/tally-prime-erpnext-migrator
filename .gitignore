@@ -2,15 +2,20 @@
 .env.db
 .env.erpnext
 .env
+runtime-uat/.env.erpnext
 
 # runtime artifacts
 data/
+runtime-uat/data/
+*.sqlite
 *.sqlite
 *.sqlite-journal
 *.log
 *.xml
 *.pdf
 config.local.yaml
+
+tallytoerpnext-desktop-uat.tar.gz
 
 # python
 __pycache__/
