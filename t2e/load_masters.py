@@ -12,7 +12,7 @@ import re
 from .config import get_config
 from .erpnext_client import ERPNextClient, ERPNextError
 from .lines import is_round_ledger
-from .mapping import CompanyDefaults, GroupTree, acc_name
+from .mapping import CompanyDefaults, GroupTree, acc_name, classify_party_ledgers, _norm
 from .staging import Staging
 
 
@@ -348,6 +348,8 @@ class MasterLoader:
         self.supplier_group = self._first_nongroup(
             "Supplier Group", ["Local", "Distributor"])
         self.territory = self._first_nongroup("Territory", ["India"])
+        self._party_names: set[str] | None = None
+        self._party_roles: dict[str, set[str]] | None = None
 
     def _first_nongroup(self, doctype: str, prefer: list[str]) -> str:
         rows = self.erp.get_list(doctype, fields=["name"],
@@ -357,6 +359,17 @@ class MasterLoader:
             if p in names:
                 return p
         return next(iter(names)) if names else prefer[0]
+
+    def _party_classification(self) -> dict[str, set[str]]:
+        if self._party_roles is None:
+            self._party_roles = classify_party_ledgers(self.store, self.tree)
+        return self._party_roles
+
+    def _billwise_party_names(self) -> set[str]:
+        """Ledgers that must post through Debtors/Creditors, not a named leaf."""
+        if self._party_names is None:
+            self._party_names = set(self._party_classification())
+        return self._party_names
 
     # ---- generic helpers -------------------------------------------------
     def _account_exists(self, fullname: str) -> bool:
@@ -609,8 +622,8 @@ class MasterLoader:
             if names is not None and r["name"] not in names:
                 continue
             group = r["parent"] or ""
-            if self.tree.party_kind(group):
-                continue  # parties handled separately
+            if _norm(r["name"]) in self._billwise_party_names():
+                continue  # parties post to Debtors/Creditors; no named GL leaf
             name = r["name"]
             # Tally's reserved P&L ledger is the carried earnings account, not a
             # normal Asset. Map it to the target retained-earnings leaf. Period
@@ -689,21 +702,13 @@ class MasterLoader:
     # ---- Parties ---------------------------------------------------------
     def load_parties(self, names: set[str] | None = None) -> tuple[int, int]:
         nc = ns = 0
-        observed: dict[str, set[str]] = {}
-        for v in self.store.vouchers():
-            party = " ".join((v["party"] or "").split())
-            if not party:
-                continue
-            if v["vtype"] in ("Sales", "Credit Note"):
-                observed.setdefault(party, set()).add("Customer")
-            elif v["vtype"] in ("Purchase", "Debit Note"):
-                observed.setdefault(party, set()).add("Supplier")
+        classified = self._party_classification()
         for r in self.store.masters("ledger"):
             if names is not None and r["name"] not in names:
                 continue
             group = r["parent"] or ""
             original_kind = self.tree.party_kind(group)
-            roles = set(observed.get(" ".join(r["name"].split()), set()))
+            roles = set(classified.get(_norm(r["name"]), set()))
             if original_kind:
                 roles.add(original_kind)
             if not roles:
@@ -754,11 +759,20 @@ class MasterLoader:
                     self.store.add_party_role(
                         r["guid"], name, kind, name)
 
-                # Keep the ledger's original source-GL mapping in master. Extra
-                # party roles live in party_role and do not overwrite an Advance
-                # account or the opposite control-account classification.
-                if original_kind:
-                    self._mark(r["guid"], original_kind, name)
+                # Bill-wise / Advances parties are Customer/Supplier masters.
+                # Do not leave erp_doctype as Account (that created named GL leaves).
+                mark_kind = original_kind
+                if not mark_kind:
+                    if "Supplier" in roles and "Customer" not in roles:
+                        mark_kind = "Supplier"
+                    elif "Customer" in roles and "Supplier" not in roles:
+                        mark_kind = "Customer"
+                    elif "Supplier" in roles:
+                        mark_kind = "Supplier"
+                    elif "Customer" in roles:
+                        mark_kind = "Customer"
+                if mark_kind:
+                    self._mark(r["guid"], mark_kind, name)
                 self._ensure_party_address_contact(
                     r["guid"], name, payload, roles)
             except ERPNextError as exc:

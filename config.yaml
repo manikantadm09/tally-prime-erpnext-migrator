@@ -14,6 +14,8 @@ tally:
   # Routine extracts begin this many days behind a clean checkpoint, so recent
   # Tally edits/cancellations are detected without re-reading all history.
   checkpoint_lookback_days: 90
+  # On WSL, localhost:9000 is often Frappe Socket.io. Override with TALLY_URL
+  # (for example http://192.168.1.5:9000 or the Windows Tally gateway port).
 
 erpnext:
   company: "YOUR ERPNext COMPANY"  # isolated ERPNext sandbox target
@@ -84,10 +86,20 @@ group_overrides:
   "Duties & Taxes":   { account_type: "Tax" }
   "Stock-in-hand":    { account_type: "Stock" }
 
-# Tally party group -> ERPNext party kind
+# Tally party group -> ERPNext party kind.
+# Advances groups are bill-wise parties, not fake asset/liability leaves.
+# Debit balances remain unallocated advances on Debtors/Creditors.
+# Income/Expense ledgers must never become Customer/Supplier even if
+# Tally Bill-wise is ON.
 party_groups:
-  customer: ["Sundry Debtors"]
-  supplier: ["Sundry Creditors"]
+  customer:
+    - "Sundry Debtors"
+    - "Advances to Debtors"
+    - "Advance from Customers"
+  supplier:
+    - "Sundry Creditors"
+    - "Advances to Vendors"
+    - "Advances to Suppliers"
 
 # ----------------------------------------------------------------------------
 # Voucher type (Tally) -> ERPNext target doctype + mode

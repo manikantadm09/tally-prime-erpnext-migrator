@@ -17,7 +17,7 @@ from .config import get_config
 from .erpnext_client import ERPNextClient, ERPNextError
 from .load_invoices import (
     InvoiceLoader, _apply_single_rate_item_gst, _gst_kind, _place_of_supply,
-    _scalar, _tax_rate, _valid_gstin,
+    _scalar, _tax_rate, _taxes_as_invoice_items, _valid_gstin,
 )
 from .load_masters import fetch_company_defaults
 from .load_vouchers import _name_of
@@ -410,10 +410,31 @@ def repair_one(erp: ERPNextClient, store: Staging, guid: str,
     source_cancelled = False
     try:
         if phase != "finalize":
-            result = loader._insert_and_submit(
+            result = loader._insert_invoice(
                 planned_doctype, doc, manual_rounding)
             candidate = _name_of(result) or _submitted(
                 erp, planned_doctype, idempotency_field, guid)
+            if (
+                candidate
+                and not loader._posted_value_matches(
+                    planned_doctype, candidate, float(row["amount"] or 0))
+            ):
+                # India Compliance recomputes HSN/template GST and changes the
+                # Tally amount. Retry with tax ledgers as explicit item lines
+                # (same path as InvoiceLoader.run) so the PI still matches.
+                erp.cancel(planned_doctype, candidate)
+                item_doctype = f"{planned_doctype} Item"
+                exact_doc = _taxes_as_invoice_items(
+                    doc,
+                    planned_doctype,
+                    suppress_target_gst=loader._supports(
+                        item_doctype, "gst_treatment"),
+                    non_gst_template=f"Non-GST - {loader.d.abbr}",
+                )
+                result = loader._insert_and_submit(
+                    planned_doctype, exact_doc, manual_rounding)
+                candidate = _name_of(result) or _submitted(
+                    erp, planned_doctype, idempotency_field, guid)
         if not candidate:
             raise FallbackRepairError(
                 "no submitted candidate exists for the requested phase")
@@ -435,16 +456,28 @@ def repair_one(erp: ERPNextClient, store: Staging, guid: str,
                 raise FallbackRepairError(
                     "required party-control bridge was not submitted")
 
-        gst_metadata = (
-            _populate_item_gst_metadata(erp, row, planned_doctype, candidate)
-            if phase == "full" else {"applied": False, "phase": phase}
+        invoice_now = _invoice_doc(erp, planned_doctype, candidate)
+        taxes_as_items = not any(
+            _money(tax.get("tax_amount"))
+            for tax in invoice_now.get("taxes") or []
         )
-        tax_evidence = _tax_evidence(
-            erp, row, planned_doctype, candidate)
+        gst_metadata = (
+            {"applied": False, "reason": "Tally tax ledgers posted as invoice item lines"}
+            if taxes_as_items else (
+                _populate_item_gst_metadata(erp, row, planned_doctype, candidate)
+                if phase == "full" else {"applied": False, "phase": phase}
+            )
+        )
+        tax_evidence = (
+            {"tax_rows_match": False, "gst_breakup_match": False, "taxes_as_items": True}
+            if taxes_as_items else _tax_evidence(
+                erp, row, planned_doctype, candidate)
+        )
         gstin_exception = _invalid_gstin_evidence(
             erp, planned_doctype, candidate, invalid_source_gstin)
-        required_tax_ok = tax_evidence["tax_rows_match"] and (
-            phase == "prepare" or tax_evidence["gst_breakup_match"])
+        required_tax_ok = taxes_as_items or (
+            tax_evidence["tax_rows_match"] and (
+                phase == "prepare" or tax_evidence["gst_breakup_match"]))
         if not required_tax_ok:
             raise FallbackRepairError(
                 "replacement invoice tax rows/GST breakup differ from Tally; "

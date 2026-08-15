@@ -13,12 +13,14 @@ from xml.etree import ElementTree as ET
 
 from t2e.config import Config
 from t2e.approve_change import ApprovalError, approve, preview
+from t2e.load_openings import OpeningsLoader
 from t2e.load_invoices import (
     InvoiceLoader,
     _supplier_bill_no,
     _tax_driven_place_of_supply,
     _taxes_as_invoice_items,
     _apply_single_rate_item_gst,
+    _resolve_party_gstin,
     _unique_bill_no,
     _unique_transaction_name,
 )
@@ -30,7 +32,9 @@ from t2e.load_masters import (
 from t2e.ledger_fidelity import account_deltas, effective_account_alias
 from t2e.load_period_closing import PeriodClosingLoader
 from t2e.load_vouchers import VoucherLoader
-from t2e.mapping import CompanyDefaults, Resolved
+from t2e.mapping import CompanyDefaults, GroupTree, Resolved, classify_party_ledgers
+from t2e.repair_pnl_party_ledgers import fiscal_year, pnl_party_candidates
+from t2e.guid_bill_references import plan_guid_bill_references
 from t2e.reconcile import _count_migrated
 from t2e.repair_party_bridges import financial_signature, unreconcile_selections
 from t2e.staging import Staging
@@ -98,7 +102,160 @@ class NamingTests(unittest.TestCase):
             _supplier_bill_no("37991", "guid-aaaaaaaa", duplicate=True),
             "37991")
 
-    def test_cancelled_prompt_name_gets_deterministic_replacement(self):
+    def test_advances_to_vendors_is_supplier_not_named_gl(self):
+        with TemporaryStaging() as store:
+            store.upsert_master(
+                "group", "g1", "Advances to Vendors", "Current Assets", {})
+            store.upsert_master(
+                "group", "g2", "Sundry Creditors", "Current Liabilities", {})
+            store.upsert_master(
+                "ledger", "l1", "CONNECTING DOTS", "Advances to Vendors", {})
+            tree = GroupTree(store)
+            self.assertEqual(tree.party_kind("Advances to Vendors"), "Supplier")
+            self.assertEqual(tree.party_kind("Sundry Creditors"), "Supplier")
+            self.assertIsNone(tree.party_kind("Current Assets"))
+
+    def test_advances_to_debtors_is_customer(self):
+        with TemporaryStaging() as store:
+            store.upsert_master(
+                "group", "g1", "Advances to Debtors", "Current Assets", {})
+            tree = GroupTree(store)
+            self.assertEqual(tree.party_kind("Advances to Debtors"), "Customer")
+
+    def test_billwise_flag_classifies_advance_ledger_as_supplier(self):
+        with TemporaryStaging() as store:
+            store.upsert_master(
+                "group", "g1", "Advances to Vendors", "Current Assets", {})
+            store.upsert_master(
+                "ledger", "l1", "CONNECTING DOTS", "Advances to Vendors",
+                {"ISBILLWISEON": "Yes"},
+            )
+            tree = GroupTree(store)
+            roles = classify_party_ledgers(store, tree)
+            self.assertEqual(roles["CONNECTING DOTS"], {"Supplier"})
+
+    def test_bank_charges_stay_named_gl(self):
+        with TemporaryStaging() as store:
+            store.upsert_master(
+                "group", "g1", "Indirect Expenses", "Primary", {})
+            store.upsert_master(
+                "ledger", "l1", "Bank Charges", "Indirect Expenses", {})
+            tree = GroupTree(store)
+            self.assertIsNone(tree.party_kind("Indirect Expenses"))
+            self.assertNotIn("Bank Charges", classify_party_ledgers(store, tree))
+
+    def test_billwise_indirect_expense_stays_named_gl(self):
+        with TemporaryStaging() as store:
+            store.upsert_master(
+                "group", "g1", "Indirect Expenses", "Primary", {})
+            store.upsert_master(
+                "ledger", "l1", "INTEREST ON TERM LOAN", "Indirect Expenses",
+                {"ISBILLWISEON": "Yes"},
+            )
+            store.upsert_voucher(
+                "v1", "Journal", "1", "2025-04-10", "", 100,
+                {"ALLLEDGERENTRIES.LIST": {
+                    "LEDGERNAME": "INTEREST ON TERM LOAN", "AMOUNT": "-100",
+                    "BILLALLOCATIONS.LIST": {
+                        "NAME": "INT-1", "BILLTYPE": "New Ref", "AMOUNT": "-100",
+                    },
+                }},
+            )
+            roles = classify_party_ledgers(store, GroupTree(store))
+            self.assertNotIn("INTEREST ON TERM LOAN", roles)
+            candidates = pnl_party_candidates(store, GroupTree(store))
+            self.assertEqual(candidates, [])
+            store.mark("master", "l1", "loaded", "Customer", "INTEREST ON TERM LOAN")
+            store.add_party_role("l1", "INTEREST ON TERM LOAN", "Customer",
+                                 "INTEREST ON TERM LOAN")
+            found = pnl_party_candidates(store, GroupTree(store))
+            self.assertEqual([row["norm"] for row in found],
+                             ["INTEREST ON TERM LOAN"])
+            self.assertEqual(fiscal_year("2025-04-01"), "2025-2026")
+            self.assertEqual(fiscal_year("2026-03-31"), "2025-2026")
+            self.assertEqual(fiscal_year("2026-04-01"), "2026-2027")
+
+    def test_billwise_deposit_stays_named_gl(self):
+        with TemporaryStaging() as store:
+            store.upsert_master(
+                "group", "g1", "Current Assets", "Primary", {})
+            store.upsert_master(
+                "group", "g2", "Deposits (Asset)", "Current Assets", {})
+            store.upsert_master(
+                "ledger", "l1", "Rental Deposit for Factory",
+                "Deposits (Asset)", {"ISBILLWISEON": "Yes"},
+            )
+            roles = classify_party_ledgers(store, GroupTree(store))
+            self.assertNotIn("Rental Deposit for Factory", roles)
+
+    def test_purchase_party_is_supplier_even_outside_sundry(self):
+        with TemporaryStaging() as store:
+            store.upsert_master(
+                "group", "g1", "Advances to Vendors", "Current Assets", {})
+            store.upsert_master(
+                "ledger", "l1", "MAHADEV", "Advances to Vendors", {})
+            store.upsert_voucher(
+                "v1", "Purchase", "1", "2024-01-10", "MAHADEV", 100,
+                {"ALLLEDGERENTRIES.LIST": {
+                    "LEDGERNAME": "MAHADEV", "AMOUNT": "100",
+                    "BILLALLOCATIONS.LIST": {
+                        "NAME": "INV-1", "BILLTYPE": "New Ref", "AMOUNT": "100",
+                    },
+                }},
+            )
+            roles = classify_party_ledgers(store, GroupTree(store))
+            self.assertEqual(roles["MAHADEV"], {"Supplier"})
+
+    def test_advance_vendor_parties_are_suppliers_not_accounts(self):
+        from t2e.repair_vendor_advance_control import (
+            VendorAdvanceControlRepair,
+            advance_vendor_parties,
+        )
+        with TemporaryStaging() as store:
+            store.upsert_master(
+                "group", "g1", "Advances to Vendors", "Current Assets", {})
+            store.upsert_master(
+                "group", "g2", "Sundry Creditors", "Current Liabilities", {})
+            store.upsert_master(
+                "ledger", "l1", "CONNECTING DOTS", "Advances to Vendors", {})
+            store.upsert_master(
+                "ledger", "l2", "Sri Lakshmi Venkateshwara Electricals",
+                "Advances to Vendors", {})
+            store.upsert_master(
+                "ledger", "l3", "Some Creditor", "Sundry Creditors", {})
+            parties = advance_vendor_parties(store, GroupTree(store))
+            self.assertEqual(
+                parties,
+                ["CONNECTING DOTS", "Sri Lakshmi Venkateshwara Electricals"])
+            self.assertNotIn("Some Creditor", parties)
+
+        repair = VendorAdvanceControlRepair.__new__(VendorAdvanceControlRepair)
+        repair.control = "Advances to Vendors - TC"
+        repair.creditors = "Creditors - TC"
+        repair.field = "tally_guid"
+        repair.d = defaults()
+        je = repair._build_je(
+            "2026-03-31", "vendor-advance-control-2026-03-31",
+            {
+                "CONNECTING DOTS": Decimal("910.00"),
+                "Royal Tough Glass Works": Decimal("-38957.00"),
+            },
+            "test",
+        )
+        accounts = {row["account"] for row in je["accounts"]}
+        self.assertEqual(
+            accounts, {"Advances to Vendors - TC", "Creditors - TC"})
+        self.assertNotIn("CONNECTING DOTS - TC", accounts)
+        self.assertNotIn("CONNECTING DOTS - EC", accounts)
+        parties = {(row["party_type"], row["party"]) for row in je["accounts"]}
+        self.assertEqual(
+            parties,
+            {("Supplier", "CONNECTING DOTS"),
+             ("Supplier", "Royal Tough Glass Works")})
+        for row in je["accounts"]:
+            self.assertEqual(row["party_type"], "Supplier")
+            self.assertTrue(row.get("party"))
+
         class ERP:
             @staticmethod
             def exists(doctype, name):
@@ -141,7 +298,7 @@ class InvoiceFidelityTests(unittest.TestCase):
         self.assertFalse(_apply_single_rate_item_gst(items, taxes))
         self.assertNotIn("cgst_amount", items[0])
 
-    def test_invalid_source_gstin_fails_closed_without_mutating_dry_run(self):
+    def test_invalid_source_gstin_is_omitted_without_blocking_the_invoice(self):
         class ERP:
             dry_run = True
 
@@ -180,12 +337,194 @@ class InvoiceFidelityTests(unittest.TestCase):
                     ],
                 },
             )
-            stats = InvoiceLoader(
-                ERP(), store, defaults(), Resolver()).run()
+            loader = InvoiceLoader(ERP(), store, defaults(), Resolver())
+            stats = loader.run()
             row = store.voucher_by_guid("bad-gstin-guid")
-            self.assertEqual(stats["error"], 1)
+            doc = loader._build(row)[0]
+            self.assertEqual(stats["error"], 0)
+            self.assertEqual(stats["planned"], 1)
             self.assertEqual(row["load_status"], "pending")
-            self.assertIsNone(row["error"])
+            self.assertNotIn("supplier_gstin", doc)
+            self.assertIn("29ALVPP7902L1ZA", doc["remarks"])
+
+    def test_invalid_voucher_gstin_uses_valid_ledger_gstin(self):
+        class ERP:
+            def has_field(self, doctype, fieldname):
+                return True
+
+        class Store:
+            @staticmethod
+            def duplicate_bill_key_count(party, billname):
+                return 1
+
+            @staticmethod
+            def masters(kind=None, status=None):
+                return [{
+                    "name": "CHIRANTH AGENCIES",
+                    "payload": json.dumps({"PARTYGSTIN": "29AACFC4867F1ZB"}),
+                }]
+
+        supplier = Resolved(
+            "party", "Creditors - TC", "Supplier", "CHIRANTH AGENCIES")
+        accounts = {
+            "CHIRANTH AGENCIES": supplier,
+            "GST PURCHASE": Resolved("account", "GST Purchase - TC"),
+            "CGST INPUT @ 9%": Resolved("account", "CGST - TC"),
+            "SGST INPUT @ 9%": Resolved("account", "SGST - TC"),
+        }
+
+        class Resolver:
+            @staticmethod
+            def get(name):
+                return accounts.get(name)
+
+            @staticmethod
+            def get_party(name, party_type):
+                return supplier if (
+                    name == "CHIRANTH AGENCIES" and party_type == "Supplier"
+                ) else None
+
+        row = {
+            "vtype": "Purchase", "party": "CHIRANTH AGENCIES",
+            "payload": json.dumps({
+                "PARTYGSTIN": "29AACF4867F1ZB",
+                "ALLLEDGERENTRIES.LIST": [
+                    {"LEDGERNAME": "CHIRANTH AGENCIES", "AMOUNT": "700"},
+                    {"LEDGERNAME": "GST PURCHASE", "AMOUNT": "-593.22"},
+                    {"LEDGERNAME": "CGST INPUT @ 9%", "AMOUNT": "-53.39"},
+                    {"LEDGERNAME": "SGST INPUT @ 9%", "AMOUNT": "-53.39"},
+                ],
+            }),
+            "vdate": "2022-09-06", "vnumber": "107", "guid": "chiranth-107",
+        }
+        doc, party, doctype, billname, bridge = InvoiceLoader(
+            ERP(), Store(), defaults(), Resolver())._build(row)
+        self.assertEqual(doctype, "Purchase Invoice")
+        self.assertEqual(doc["supplier_gstin"], "29AACFC4867F1ZB")
+        self.assertIn("29AACF4867F1ZB", doc["remarks"])
+        self.assertIn("29AACFC4867F1ZB", doc["remarks"])
+
+    def test_invalid_voucher_gstin_uses_valid_gstin_from_other_voucher(self):
+        class ERP:
+            def has_field(self, doctype, fieldname):
+                return True
+
+        class Store:
+            @staticmethod
+            def duplicate_bill_key_count(party, billname):
+                return 1
+
+            @staticmethod
+            def masters(kind=None, status=None):
+                return [{"name": "M/S FACADE CRAFT", "payload": "{}"}]
+
+            @staticmethod
+            def vouchers(vtype=None, status=None, order_by_date=True,
+                         include_inactive=False):
+                return [{
+                    "party": "M/S FACADE CRAFT",
+                    "payload": json.dumps({"PARTYGSTIN": "29CAJPD1537N1ZE"}),
+                }]
+
+        supplier = Resolved(
+            "party", "Creditors - TC", "Supplier", "M/S FACADE CRAFT")
+        accounts = {
+            "M/S FACADE CRAFT": supplier,
+            "GST PURCHASE": Resolved("account", "GST Purchase - TC"),
+            "CGST INPUT @ 9%": Resolved("account", "CGST - TC"),
+            "SGST INPUT @ 9%": Resolved("account", "SGST - TC"),
+        }
+
+        class Resolver:
+            @staticmethod
+            def get(name):
+                return accounts.get(name)
+
+            @staticmethod
+            def get_party(name, party_type):
+                return supplier if (
+                    name == "M/S FACADE CRAFT" and party_type == "Supplier"
+                ) else None
+
+        row = {
+            "vtype": "Purchase", "party": "M/S FACADE CRAFT",
+            "payload": json.dumps({
+                "PARTYGSTIN": "29CAPD1537N1ZE",
+                "ALLLEDGERENTRIES.LIST": [
+                    {"LEDGERNAME": "M/S FACADE CRAFT", "AMOUNT": "274527"},
+                    {"LEDGERNAME": "GST PURCHASE", "AMOUNT": "-232650"},
+                    {"LEDGERNAME": "CGST INPUT @ 9%", "AMOUNT": "-20938.50"},
+                    {"LEDGERNAME": "SGST INPUT @ 9%", "AMOUNT": "-20938.50"},
+                ],
+            }),
+            "vdate": "2024-02-10", "vnumber": "228", "guid": "facade-228",
+        }
+        doc = InvoiceLoader(
+            ERP(), Store(), defaults(), Resolver())._build(row)[0]
+        self.assertEqual(doc["supplier_gstin"], "29CAJPD1537N1ZE")
+        self.assertIn("29CAPD1537N1ZE", doc["remarks"])
+
+    def test_party_expense_line_falls_back_to_journal(self):
+        class ERP:
+            def has_field(self, doctype, fieldname):
+                return True
+
+        class Store:
+            @staticmethod
+            def duplicate_bill_key_count(party, billname):
+                return 1
+
+        billed = Resolved(
+            "party", "Creditors - TC", "Supplier", "Blue Star Power Tools")
+        other = Resolved(
+            "party", "Creditors - TC", "Supplier", "CONNECTING DOTS")
+        accounts = {
+            "Blue Star Power Tools": billed,
+            "CONNECTING DOTS": other,
+            "CGST INPUT @ 9%": Resolved("account", "CGST - TC"),
+            "SGST INPUT @ 9%": Resolved("account", "SGST - TC"),
+        }
+
+        class Resolver:
+            @staticmethod
+            def get(name):
+                return accounts.get(name)
+
+            @staticmethod
+            def get_party(name, party_type):
+                if party_type != "Supplier":
+                    return None
+                return accounts.get(name) if accounts.get(name) and getattr(
+                    accounts.get(name), "kind", None) == "party" else None
+
+        row = {
+            "vtype": "Purchase", "party": "Blue Star Power Tools",
+            "payload": json.dumps({
+                "PARTYGSTIN": "29DPHPM1393M2Z6",
+                "ALLLEDGERENTRIES.LIST": [
+                    {"LEDGERNAME": "Blue Star Power Tools", "AMOUNT": "1074"},
+                    {"LEDGERNAME": "CONNECTING DOTS", "AMOUNT": "-910"},
+                    {"LEDGERNAME": "SGST INPUT @ 9%", "AMOUNT": "-82"},
+                    {"LEDGERNAME": "CGST INPUT @ 9%", "AMOUNT": "-82"},
+                ],
+            }),
+            "vdate": "2025-06-18", "vnumber": "76", "guid": "blue-star-76",
+        }
+        self.assertIsNone(InvoiceLoader(
+            ERP(), Store(), defaults(), Resolver())._build(row))
+
+    def test_resolve_party_gstin_prefers_valid_voucher_then_ledger(self):
+        self.assertEqual(
+            _resolve_party_gstin("29AACFC4867F1ZB", "36AALCA0171E1Z0"),
+            ("29AACFC4867F1ZB", ""),
+        )
+        gstin, warning = _resolve_party_gstin(
+            "29AACF4867F1ZB", "29AACFC4867F1ZB")
+        self.assertEqual(gstin, "29AACFC4867F1ZB")
+        self.assertIn("29AACF4867F1ZB", warning)
+        gstin, warning = _resolve_party_gstin("29ALVPP7902L1ZA", "")
+        self.assertEqual(gstin, "")
+        self.assertIn("29ALVPP7902L1ZA", warning)
 
     def test_ledger_fidelity_delta_reclassifies_without_changing_value(self):
         desired = {
@@ -316,6 +655,13 @@ class InvoiceFidelityTests(unittest.TestCase):
         self.assertEqual(doc["place_of_supply"], "29-Karnataka")
         self.assertEqual(len(doc["taxes"]), 2)
         self.assertEqual([t["rate"] for t in doc["taxes"]], [9.0, 9.0])
+        self.assertEqual(
+            [t["gst_tax_type"] for t in doc["taxes"]], ["cgst", "sgst"])
+        self.assertEqual(
+            [t["charge_type"] for t in doc["taxes"]],
+            ["Actual", "Actual"])
+        self.assertEqual(doc["items"][0]["cgst_rate"], 9.0)
+        self.assertEqual(doc["items"][0]["sgst_rate"], 9.0)
         self.assertNotIn(
             "ROUND", " ".join(t["description"] for t in doc["taxes"]))
         self.assertIn("TOWARDS PURCHASE", doc["items"][0]["description"])
@@ -407,7 +753,7 @@ class InvoiceFidelityTests(unittest.TestCase):
             {"source_total": 2850.0, "unrounded_total": 2849.0})
         self.assertEqual(len(doc["taxes"]), 2)
 
-    def test_nonstandard_source_party_requires_control_bridge(self):
+    def test_advance_vendor_posts_to_creditors_without_named_leaf_or_bridge(self):
         class ERP:
             dry_run = True
 
@@ -422,13 +768,12 @@ class InvoiceFidelityTests(unittest.TestCase):
 
         supplier = Resolved(
             "party", "Creditors - TC", "Supplier", "Vendor Advance")
-        advance = Resolved("account", "Advances to Vendors - TC")
 
         class Resolver:
             @staticmethod
             def get(name):
                 return {
-                    "Vendor Advance": advance,
+                    "Vendor Advance": supplier,
                     "Purchases": Resolved("account", "Purchases - TC"),
                 }.get(name)
 
@@ -448,7 +793,9 @@ class InvoiceFidelityTests(unittest.TestCase):
         }
         built = InvoiceLoader(
             ERP(), Store(), defaults(), Resolver())._build(row)
-        self.assertIsNotNone(built[-1])
+        self.assertIsNone(built[-1])
+        self.assertEqual(built[0]["credit_to"], "Creditors - TC")
+        self.assertEqual(built[0]["supplier"], "Vendor Advance")
 
     def test_party_control_bridge_uses_supported_unreconcile_shape(self):
         rows = unreconcile_selections(
@@ -493,7 +840,7 @@ class ConfigurationTests(unittest.TestCase):
                 "t2e.config._read_env",
                 side_effect=AssertionError("secret file should be lazy")):
             cfg = Config()
-            self.assertEqual(cfg.tally["url"], "http://127.0.0.1:9000")
+            self.assertEqual(cfg.yaml["tally"]["url"], "http://127.0.0.1:9000")
 
 
 class MasterDryRunTests(unittest.TestCase):
@@ -873,30 +1220,69 @@ class BillReferenceTests(unittest.TestCase):
             self.assertEqual(
                 [r["invoice"] for r in refs], ["PI-1", "PI-2"])
 
-    def test_duplicate_bill_allocation_is_fifo(self):
-        class ERP:
-            dry_run = True
+    def test_insert_does_not_attach_agst_ref(self):
+        loader = VoucherLoader.__new__(VoucherLoader)
+        loader.store = None
+        res = Resolved("party", "Creditors - TC", "Supplier", "CONNECTING DOTS")
+        rows = loader._party_je_rows(
+            res,
+            {"magnitude": 150.0, "is_debit": False,
+             "bills": [{"name": "DUP-1", "type": "Agst Ref", "amount": 150.0}]},
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("reference_type", rows[0])
+        self.assertNotIn("reference_name", rows[0])
+        self.assertEqual(rows[0]["credit_in_account_currency"], 150.0)
 
-            def get_list(self, doctype, fields=None, filters=None, limit=0):
-                name = filters[0][2]
-                amount = {"PI-1": 100.0, "PI-2": 80.0}[name]
-                return [{"outstanding_amount": amount}]
+    def test_guid_agst_ref_is_exact_named_invoice_never_fifo(self):
+        with TemporaryStaging() as store:
+            store.upsert_voucher(
+                "inv-1", "Purchase", "1", "2024-01-10", "Supplier A", 100,
+                {"ALLLEDGERENTRIES.LIST": {
+                    "LEDGERNAME": "Supplier A", "AMOUNT": "100",
+                    "BILLALLOCATIONS.LIST": {
+                        "NAME": "DUP-1", "BILLTYPE": "New Ref", "AMOUNT": "100",
+                    },
+                }},
+            )
+            store.mark("voucher", "inv-1", "loaded", "Purchase Invoice", "PI-1")
+            store.add_bill_ref(
+                "Supplier A", "DUP-1", "Purchase Invoice", "PI-1")
+            store.upsert_voucher(
+                "pay-1", "Payment", "2", "2024-01-11", "Supplier A", 100,
+                {"ALLLEDGERENTRIES.LIST": {
+                    "LEDGERNAME": "Supplier A", "AMOUNT": "-100",
+                    "BILLALLOCATIONS.LIST": {
+                        "NAME": "DUP-1", "BILLTYPE": "Agst Ref", "AMOUNT": "-100",
+                    },
+                }},
+            )
+            store.mark("voucher", "pay-1", "loaded", "Payment Entry", "PE-1")
+            plan = plan_guid_bill_references(store)
+            self.assertEqual(len(plan["allocations"]), 1)
+            self.assertEqual(plan["allocations"][0]["invoice_name"], "PI-1")
+            self.assertEqual(plan["allocations"][0]["settlement_name"], "PE-1")
+            self.assertEqual(plan["exceptions"], [])
 
+    def test_ambiguous_bill_name_is_exception_not_fifo(self):
         with TemporaryStaging() as store:
             store.add_bill_ref(
                 "Supplier A", "DUP-1", "Purchase Invoice", "PI-1")
             store.add_bill_ref(
                 "Supplier A", "DUP-1", "Purchase Invoice", "PI-2")
-            loader = VoucherLoader(ERP(), store, defaults(), resolver=None)
-            refs = loader._bill_references(
-                "Supplier A",
-                [{"name": "DUP-1", "type": "Agst Ref", "amount": 150.0}],
-                150.0,
+            store.upsert_voucher(
+                "pay-1", "Payment", "2", "2024-01-11", "Supplier A", 150,
+                {"ALLLEDGERENTRIES.LIST": {
+                    "LEDGERNAME": "Supplier A", "AMOUNT": "-150",
+                    "BILLALLOCATIONS.LIST": {
+                        "NAME": "DUP-1", "BILLTYPE": "Agst Ref", "AMOUNT": "-150",
+                    },
+                }},
             )
-            self.assertEqual(
-                [(r["reference_name"], r["allocated_amount"]) for r in refs],
-                [("PI-1", 100.0), ("PI-2", 50.0)],
-            )
+            store.mark("voucher", "pay-1", "loaded", "Payment Entry", "PE-1")
+            plan = plan_guid_bill_references(store)
+            self.assertEqual(plan["allocations"], [])
+            self.assertEqual(plan["exceptions"][0]["reason"], "ambiguous_bill_name")
 
 
 class IdempotencyTests(unittest.TestCase):
@@ -1124,6 +1510,32 @@ class CheckpointTests(unittest.TestCase):
             self.assertIsNone(store.get_checkpoint())
             store.set_checkpoint("20260601")
             self.assertEqual(store.get_checkpoint(), "20260601")
+
+
+class OpeningBalanceTests(unittest.TestCase):
+    def test_zero_tally_openings_do_not_submit_empty_opening_entry(self):
+        class ERP:
+            dry_run = False
+            submitted = False
+
+            def ensure_custom_field(self, *args, **kwargs):
+                return None
+
+            def find_by_field(self, *args, **kwargs):
+                return None
+
+            def submit_doc(self, doctype, doc):
+                self.submitted = True
+                raise AssertionError("empty opening JE must not be submitted")
+
+        loader = OpeningsLoader.__new__(OpeningsLoader)
+        loader.erp = ERP()
+        loader.field = "tally_guid"
+        loader._fetch_openings = lambda: []
+        stats, preview, name = loader.run()
+        self.assertEqual(stats, {"created": 0, "skipped": 1, "lines": 0})
+        self.assertIsNone(name)
+        self.assertFalse(loader.erp.submitted)
 
 
 class ApproveChangeTests(unittest.TestCase):

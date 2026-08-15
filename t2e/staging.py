@@ -298,6 +298,24 @@ class Staging:
         self.conn.execute("DELETE FROM party_role")
         self.conn.commit()
 
+    def delete_party_roles_for(self, ledger_names: set[str]) -> int:
+        """Drop party_role rows for named ledgers (normalized match)."""
+        wanted = {" ".join((name or "").split()) for name in ledger_names}
+        wanted.discard("")
+        if not wanted:
+            return 0
+        n = 0
+        for row in list(self.party_roles()):
+            key = " ".join((row["ledger_name"] or "").split())
+            if key in wanted:
+                self.conn.execute(
+                    "DELETE FROM party_role WHERE ledger_guid=? AND party_type=?",
+                    (row["ledger_guid"], row["party_type"]))
+                n += 1
+        if n:
+            self.conn.commit()
+        return n
+
     # ---- source replacement ---------------------------------------------
     def clear_voucher_window(self, from_iso: str, to_iso: str) -> int:
         """Mark a re-exported source window absent before staging it.

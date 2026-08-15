@@ -64,7 +64,8 @@ _MASTER_SPECS = [
     ("ledger",     "Ledger",        ["Name", "Parent", "OpeningBalance", "GUID",
                                       "GSTRegistrationType", "PartyGSTIN", "LedgerPhone",
                                       "Email", "LedgerContact", "Address", "PinCode",
-                                      "CountryName", "LedgerStateName", "BillCreditPeriod"]),
+                                      "CountryName", "LedgerStateName", "BillCreditPeriod",
+                                      "IsBillWiseOn"]),
     ("vouchertype", "VoucherType",  ["Name", "Parent", "GUID"]),
 ]
 
