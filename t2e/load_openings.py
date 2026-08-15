@@ -125,9 +125,17 @@ class OpeningsLoader:
         openings = self._fetch_openings()
         existing = self.erp.find_by_field(
             "Journal Entry", self.field, key, exclude_cancelled=True)
-        doc, preview = self._build_je(openings, key)
         if existing:
-            return {"created": 0, "skipped": 1, "lines": len(openings)}, preview, existing
+            return {"created": 0, "skipped": 1, "lines": len(openings)}, [], existing
+        if not openings:
+            # Company books start at the first voucher; Tally has no pre-window
+            # opening balance sheet. Do not submit an empty Opening Entry:
+            # ERPNext then treats every stock account as in-scope and rejects
+            # Closing Stock.
+            return {"created": 0, "skipped": 1, "lines": 0}, [], None
+        doc, preview = self._build_je(openings, key)
+        if not doc.get("accounts"):
+            return {"created": 0, "skipped": 1, "lines": 0}, preview, None
         res = self.erp.submit_doc("Journal Entry", doc)
         name = _name_of(res) or ("(dry-run)" if self.erp.dry_run else None)
         return {"created": 1, "skipped": 0, "lines": len(openings)}, preview, name

@@ -109,7 +109,7 @@ class ClosingStockLoader:
                 continue
             je = self._build_je(date, prev, closing, key)
             try:
-                res = self.erp.submit_doc("Journal Entry", je)
+                res = self.erp.insert_and_submit("Journal Entry", je)
                 name = _name_of(res) or ("(dry-run)" if self.erp.dry_run else None)
                 stats["created"] += 1
                 results.append((date, prev, closing, "created", name))

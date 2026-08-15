@@ -286,6 +286,26 @@ def cmd_wipe_db(args) -> int:
     return 0
 
 
+def cmd_load_bill_references(args) -> int:
+    """GUID-backed Agst Ref after documents exist. Never FIFO."""
+    from .guid_bill_references import GuidBillReferenceLoader, plan_guid_bill_references
+    erp, s = ERPNextClient(dry_run=not args.confirm), Staging()
+    _banner(erp.dry_run)
+    plan = plan_guid_bill_references(s)
+    print("  plan:", plan["summary"])
+    if plan["exceptions"]:
+        reasons = plan["summary"].get("exception_reasons") or {}
+        print("  source exceptions (not invented):", reasons)
+    stats = GuidBillReferenceLoader(erp, s).run(plan)
+    print("  bill-reference load:", {
+        k: stats[k] for k in
+        ("applied", "skipped", "errors", "gl_unchanged", "pass")
+    })
+    print(f"  -> {stats['report']}")
+    s.close()
+    return 0 if stats.get("pass") else 1
+
+
 def cmd_reconcile(args) -> int:
     from .reconcile import build_report, print_summary
     erp, s = ERPNextClient(dry_run=True), Staging()
@@ -406,6 +426,48 @@ def cmd_load_closing_stock(args) -> int:
     return 0
 
 
+def cmd_repair_pnl_party_ledgers(args) -> int:
+    from .load_masters import fetch_company_defaults
+    from .repair_pnl_party_ledgers import PnlPartyLedgerRepair
+    erp, store = ERPNextClient(dry_run=not args.confirm), Staging()
+    _banner(erp.dry_run)
+    repair = PnlPartyLedgerRepair(erp, store, fetch_company_defaults(erp))
+    try:
+        report = repair.run(
+            reopen_period_closings=args.reopen_period_closings)
+    except Exception as exc:
+        print(f"  ! {exc}", file=sys.stderr)
+        store.close()
+        return 1
+    print(json.dumps(report, indent=2, default=str))
+    store.close()
+    return 1 if any(
+        row.get("status") == "error" for row in report.get("journals") or []
+    ) else 0
+
+
+def cmd_repair_vendor_advance_control(args) -> int:
+    from .load_masters import fetch_company_defaults
+    from .repair_vendor_advance_control import VendorAdvanceControlRepair
+    erp, store = ERPNextClient(dry_run=not args.confirm), Staging()
+    _banner(erp.dry_run)
+    repair = VendorAdvanceControlRepair(
+        erp, store, fetch_company_defaults(erp))
+    try:
+        report = repair.run(
+            reopen_period_closings=args.reopen_period_closings,
+            rebuild_year_ends=args.rebuild_year_ends)
+    except Exception as exc:
+        print(f"  ! {exc}", file=sys.stderr)
+        store.close()
+        return 1
+    print(json.dumps(report, indent=2, default=str))
+    store.close()
+    return 1 if any(
+        row.get("status") == "error" for row in report.get("journals") or []
+    ) else 0
+
+
 def cmd_load_period_closing(args) -> int:
     from .load_masters import fetch_company_defaults
     from .load_period_closing import PeriodClosingLoader
@@ -481,13 +543,13 @@ def cmd_run_all(args) -> int:
     erp, s = ERPNextClient(dry_run=not args.confirm), Staging()
     _banner(erp.dry_run)
 
-    print("\n[1/9] Safe wipe of migration-created records")
+    print("\n[1/10] Safe wipe of migration-created records")
     if not erp.dry_run:
         from .wipe import wipe
         print("  wiped:", wipe(erp, with_masters=args.with_masters))
         _reset_staging_after_wipe(args.with_masters)
 
-    print("\n[2/9] Ensure fiscal years and load masters")
+    print("\n[2/10] Ensure fiscal years and load masters")
     cfg = get_config()
     print("  fiscal years:", ensure_fiscal_years(
         erp,
@@ -496,12 +558,12 @@ def cmd_run_all(args) -> int:
         dry_run=erp.dry_run))
     defaults = _masters(erp, s)
 
-    print("\n[3/9] Load source opening balances")
+    print("\n[3/10] Load source opening balances")
     opening_stats, _, opening_name = OpeningsLoader(
         erp, s, defaults).run()
     print("  opening balances:", opening_stats, "->", opening_name)
 
-    print("\n[4/9] Load Sales/Purchase invoices")
+    print("\n[4/10] Load Sales/Purchase invoices")
     if not erp.dry_run:
         ensure_generic_item(erp)
     resolver = LedgerResolver(s, defaults)
@@ -511,9 +573,13 @@ def cmd_run_all(args) -> int:
         print(f"  {i}/{total}  planned={st.get('planned', 0)} "
               f"loaded={st['loaded']} skipped={st.get('skipped', 0)} "
               f"fallback={st['fallback']} error={st['error']}")
-    print("  invoices:", il.run(progress=iprog))
+    invoice_stats = il.run(progress=iprog)
+    print("  invoices:", invoice_stats)
+    if invoice_stats.get("cancelled_retries"):
+        print("  ! cancelled retry shells remain on submitted replacements; "
+              "purge them after verifying each GUID has a live invoice")
 
-    print("\n[5/9] Load payments / journals (linked to invoices)")
+    print("\n[5/10] Load payments / journals with no Agst Ref")
     resolver = LedgerResolver(s, defaults)  # refresh after invoices/bill index
     vl = VoucherLoader(erp, s, defaults, resolver)
 
@@ -525,37 +591,51 @@ def cmd_run_all(args) -> int:
     if vl.unresolved:
         print(f"  ! {len(vl.unresolved)} unresolved ledgers")
 
-    print("\n[6/9] Load Tally closing-stock adjustments")
+    print("\n[6/10] GUID-backed bill references (Agst Ref exact; never FIFO)")
+    from .guid_bill_references import GuidBillReferenceLoader, plan_guid_bill_references
+    bill_plan = plan_guid_bill_references(s)
+    print("  bill-reference plan:", bill_plan["summary"])
+    bill_stats = GuidBillReferenceLoader(erp, s).run(bill_plan)
+    print("  bill-reference load:", {
+        k: bill_stats[k] for k in
+        ("applied", "skipped", "errors", "gl_unchanged", "pass")
+        if k in bill_stats
+    })
+    print(f"  -> {bill_stats.get('report')}")
+
+    print("\n[7/10] Load Tally closing-stock adjustments")
     closing_stats, closing_results = ClosingStockLoader(
         erp, defaults).run()
     for row in closing_results:
         print(" ", row)
     print("  closing-stock:", closing_stats)
 
-    print("\n[7/9] Reclass target-substituted invoice accounts to Tally ledgers")
+    print("\n[8/10] Reclass target-substituted invoice accounts to Tally ledgers")
     fidelity_stats = LedgerFidelityLoader(
         erp, s, defaults, LedgerResolver(s, defaults)).run()
     print("  ledger fidelity:", fidelity_stats)
 
-    print("\n[8/9] Close fiscal-year P&L to retained earnings")
+    print("\n[9/10] Close fiscal-year P&L to retained earnings")
     pc_stats, pc_results = PeriodClosingLoader(erp, defaults).run()
     for row in pc_results:
         print(" ", row)
     print("  period-closing:", pc_stats)
 
-    print("\n[9/9] Reconcile")
+    print("\n[10/10] Reconcile")
     print_summary(build_report(erp, s))
-    print("  payment reconciliation was not auto-applied; run the explicit "
-          "reconcile-payments dry run and review its report before --confirm")
+    print("  FIFO reconcile-payments was not auto-applied and must not be used "
+          "for Tally-fidelity. GUID Agst Ref is the bill-reference phase.")
     s.close()
     return 0
 
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="t2e", description="Tally -> ERPNext migration")
-    p.add_argument("--env", choices=["prd", "dev", "PRD", "DEV"], default=None,
-                   help="target environment (PRD or DEV); default from config/PRD. "
-                        "Use as: python -m t2e --env dev <command>")
+    p.add_argument("--env", choices=["prd", "dev", "uat", "PRD", "DEV", "UAT"],
+                   default=None,
+                   help="target environment (PRD, DEV, or UAT). "
+                        "UAT is the clean remigration site. Never point UAT "
+                        "at frozen-dev staging. Use: python -m t2e --env uat <command>")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     ex = sub.add_parser("extract")
@@ -629,6 +709,12 @@ def main(argv=None) -> int:
         lv.add_argument("--limit", type=int, default=0)
         lv.set_defaults(func=fn)
 
+    br = sub.add_parser(
+        "load-bill-references",
+        help="GUID-backed Agst Ref after insert: exact named invoice, never FIFO")
+    br.add_argument("--confirm", action="store_true", help="execute allocations")
+    br.set_defaults(func=cmd_load_bill_references)
+
     sub.add_parser("reconcile").set_defaults(func=cmd_reconcile)
 
     rp = sub.add_parser("reconcile-payments",
@@ -699,6 +785,29 @@ def main(argv=None) -> int:
                         help="post year-end closing-stock adjustment Journal Entries")
     cs.add_argument("--confirm", action="store_true", help="execute writes")
     cs.set_defaults(func=cmd_load_closing_stock)
+
+    rpl = sub.add_parser(
+        "repair-pnl-party-ledgers",
+        help="reclass Income/Expense ledgers wrongly loaded as Customer/Supplier")
+    rpl.add_argument("--confirm", action="store_true", help="execute writes")
+    rpl.add_argument(
+        "--reopen-period-closings", action="store_true",
+        help="cancel and recreate migration PCVs covering the reclass years")
+    rpl.set_defaults(func=cmd_repair_pnl_party_ledgers)
+
+    vac = sub.add_parser(
+        "repair-vendor-advance-control",
+        help="one Current Assets Advances to Vendors leaf; keep suppliers; "
+             "reclass Creditors debit (UAT only)")
+    vac.add_argument("--confirm", action="store_true", help="execute writes")
+    vac.add_argument(
+        "--reopen-period-closings", action="store_true",
+        help="cancel and recreate FY 2025-26 PCV only (2026-27 stays open)")
+    vac.add_argument(
+        "--rebuild-year-ends", action="store_true",
+        help="cancel existing control JEs and post Advances deltas at each "
+             "FY end from 2022-23 so every year-end BS matches Tally")
+    vac.set_defaults(func=cmd_repair_vendor_advance_control)
 
     pcv = sub.add_parser(
         "load-period-closing",

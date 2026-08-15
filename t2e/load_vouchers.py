@@ -2,8 +2,11 @@
 
 Strategy (decided with the user):
 * Receipt / Payment  -> Payment Entry when the voucher fits the clean
-  party+bank shape, otherwise a Journal Entry (so nothing is ever dropped).
-* Sales / Purchase / Journal / Contra / Credit Note / Debit Note -> Journal Entry.
+  bank/cash-to-party shape, otherwise a Journal Entry (so nothing is ever dropped).
+* Composite Tally vouchers (TDS, bank charges, extra ledgers) stay Journal Entry.
+* Party lines always post to Debtors/Creditors with party_type/party.
+* Agst Ref is NOT attached during insert. A later GUID-backed bill-reference
+  phase links exact named invoices; New Ref / genuine advances stay unallocated.
 
 A Journal Entry reproduces the exact Tally ledger postings: every
 ALLLEDGERENTRIES line becomes a debit or credit row, party lines post against
@@ -115,8 +118,6 @@ class VoucherLoader:
                 # (flagged via self.unresolved + report) so the books still tie.
                 res = Resolved("account", self.d.suspense)
             if res.kind == "party":
-                # Split into one row per matched invoice bill so the journal
-                # reduces that invoice's outstanding; remainder stays unlinked.
                 rows = self._party_je_rows(res, e)
             else:
                 row = {"account": res.account, "cost_center": self.d.cost_center}
@@ -145,37 +146,15 @@ class VoucherLoader:
         }
 
     def _party_je_rows(self, res: Resolved, e: dict) -> list[dict]:
-        """One JE row per Agst-Ref bill that maps to a migrated invoice (carrying
-        reference_type/reference_name so the invoice gets settled), plus a
-        remainder row for any unallocated amount."""
-        rows: list[dict] = []
-        remaining = round(e["magnitude"], 2)
-        for b in e.get("bills", []):
-            if b.get("type") != "Agst Ref":
-                continue
-            bill_remaining = round(min(b["amount"], remaining), 2)
-            for ref in self.store.get_bill_refs(res.party, b["name"]):
-                outstanding = self._invoice_outstanding(
-                    ref["doctype"], ref["invoice"])
-                alloc = round(
-                    min(bill_remaining, remaining, outstanding), 2)
-                if alloc <= 0:
-                    continue
-                row = {"account": res.account, "party_type": res.party_type,
-                       "party": res.party, "reference_type": ref["doctype"],
-                       "reference_name": ref["invoice"]}
-                _put(row, e["is_debit"], alloc)
-                rows.append(row)
-                remaining = round(remaining - alloc, 2)
-                bill_remaining = round(bill_remaining - alloc, 2)
-                if remaining <= 0.001 or bill_remaining <= 0.001:
-                    break
-        if remaining > 0.001 or not rows:
-            row = {"account": res.account, "party_type": res.party_type,
-                   "party": res.party}
-            _put(row, e["is_debit"], remaining if rows else round(e["magnitude"], 2))
-            rows.append(row)
-        return rows
+        """Post the party line to the control account only.
+
+        Agst Ref is applied later by the GUID-backed bill-reference phase so
+        insert never FIFO-allocates or invents a bill.
+        """
+        row = {"account": res.account, "party_type": res.party_type,
+               "party": res.party}
+        _put(row, e["is_debit"], round(e["magnitude"], 2))
+        return [row]
 
     def _invoice_outstanding(self, doctype: str, name: str) -> float:
         rows = self.erp.get_list(doctype, fields=["outstanding_amount"],
@@ -265,10 +244,8 @@ class VoucherLoader:
             doc["paid_to"] = party_account     # creditor control
             doc["paid_from_account_currency"] = self.d.currency
 
-        # allocate against migrated invoices so they become Paid/Partially Paid
-        refs = self._bill_references(pres.party, pe.get("bills", []), amount)
-        if refs:
-            doc["references"] = refs
+        # Do not attach Agst Ref here. The GUID-backed bill-reference phase
+        # allocates the exact named invoice after every document exists.
         return doc
 
     # ---- public entry point ---------------------------------------------
@@ -381,11 +358,15 @@ def _balance(accounts, total_dr, total_cr, d: CompanyDefaults):
 
 
 def _looks_like_bank(ledger: str, res: Resolved) -> bool:
-    # Heuristic: resolver maps to a GL account; treat cash/bank-ish names as bank.
+    if res.kind != "account":
+        return False
+    if (res.account_type or "") in ("Bank", "Cash"):
+        return True
+    # Name fallback for bank/cash ledgers whose Tally group was not mapped.
     name = ledger.lower()
     keys = ("bank", "cash", "hdfc", "icici", "axis", "canara", "sbi", "kotak",
             "loan a/c", "od a/c", "occ", "current a/c", "petty cash")
-    return res.kind == "account" and any(k in name for k in keys)
+    return any(k in name for k in keys)
 
 
 def _je_voucher_type(tally_vtype: str) -> str:
