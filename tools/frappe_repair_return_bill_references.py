@@ -8,9 +8,9 @@ self-referencing Payment Ledger Entry with accounting-neutral references to
 the exact Tally bills.
 
 Run with the target bench Python after taking a fresh database backup.  The
-command is plan-only unless ``--confirm`` is supplied.  It is deliberately
-bound to the known production documents, parties, amounts and before/after
-outstandings and refuses partial or unexpected state.
+command is plan-only unless ``--confirm`` is supplied.  It is bound to the
+UAT documents, parties, amounts and before/after outstandings on
+dev-site.local and refuses partial or unexpected state.
 """
 from __future__ import annotations
 
@@ -24,69 +24,69 @@ from pathlib import Path
 COMPANY = "Spaceki Designs LLP"
 PENNY = Decimal("0.01")
 
-# Return doctype/name -> exact source and target state proved from Tally's
-# native bill reports and dev.spaceki.com's live Payment Ledger on 2026-08-12.
+# Return doctype/name -> exact source and target state proved from Tally
+# voucher bill allocations and UAT (dev-site.local) Payment Ledger.
+# SHAILENDRA SRET-26-00001 is a New Ref credit note paid by receipts, not an
+# Agst Ref against the sales invoice, so it is intentionally absent.
 REPAIRS = (
     {
         "doctype": "Sales Invoice",
-        "return": "SRET-26-00006",
+        "return": "SRET-26-00003",
         "party_type": "Customer",
         "party": "MAHENDRA HOMES PRIVATE LIMITED",
         "account": "Debtors - SDL",
         "return_outstanding_before": "-1242677.00",
         "allocations": (
-            {"target": "SINV-26-00090", "amount": "1242677.00",
-             "target_before": "2187287.00", "target_after": "944610.00"},
+            {"target": "SINV-26-00018", "amount": "1242677.00",
+             "target_before": "3498912.00", "target_after": "2256235.00"},
         ),
     },
     {
         "doctype": "Sales Invoice",
-        "return": "SRET-26-00005",
+        "return": "SRET-26-00002",
         "party_type": "Customer",
         "party": "MAHENDRA HOMES PRIVATE LIMITED",
         "account": "Debtors - SDL",
         "return_outstanding_before": "-390630.00",
         "allocations": (
-            {"target": "SINV-26-00091", "amount": "390630.00",
-             "target_before": "865098.00", "target_after": "474468.00"},
+            {"target": "SINV-26-00019", "amount": "390630.00",
+             "target_before": "2865433.00", "target_after": "2474803.00"},
         ),
     },
     {
         "doctype": "Purchase Invoice",
-        "return": "PRET-26-00009",
+        "return": "PRET-26-00001",
         "party_type": "Supplier",
         "party": "P.C SAMPATH & CO",
         "account": "Creditors - SDL",
         "return_outstanding_before": "-16567.00",
         "allocations": (
-            {"target": "PINV-26-01249", "amount": "16567.00",
+            {"target": "PINV-26-00036", "amount": "16567.00",
              "target_before": "21841.00", "target_after": "5274.00"},
         ),
     },
     {
         "doctype": "Purchase Invoice",
-        "return": "PRET-26-00010",
+        "return": "PRET-26-00002",
         "party_type": "Supplier",
         "party": "THE LIGHT PLACE",
         "account": "Creditors - SDL",
         "return_outstanding_before": "-16231.00",
         "allocations": (
-            {"target": "PINV-26-01381", "amount": "124.00",
-             "target_before": "124.00", "target_after": "0.00"},
-            {"target": "PINV-26-01398", "amount": "16107.00",
-             "target_before": "16107.00", "target_after": "0.00"},
+            {"target": "PINV-26-00057", "amount": "16231.00",
+             "target_before": "169583.00", "target_after": "153352.00"},
         ),
     },
     {
         "doctype": "Purchase Invoice",
-        "return": "PRET-26-00011",
+        "return": "PRET-26-00003",
         "party_type": "Supplier",
         "party": "VIJAYALAXMI TIMBER DEPOT",
         "account": "Creditors - SDL",
         "return_outstanding_before": "-76225.00",
         "allocations": (
-            {"target": "PINV-26-01491", "amount": "76225.00",
-             "target_before": "76225.00", "target_after": "0.00"},
+            {"target": "PINV-26-00278", "amount": "76225.00",
+             "target_before": "333395.00", "target_after": "257170.00"},
         ),
     },
 )
@@ -372,7 +372,11 @@ def main() -> int:
 
         gl_after = active_gl_signature(frappe, COMPANY)
         ple_after = active_ple_signature(frappe, COMPANY)
-        expected_row_delta = 1 if args.confirm and not already_applied else 0
+        expected_row_delta = 0
+        if args.confirm and not already_applied:
+            expected_row_delta = sum(
+                len(repair["allocations"]) for repair in REPAIRS
+            ) - len(REPAIRS)
         gl_unchanged = gl_before == gl_after
         ple_value_unchanged = (
             ple_before["amount"] == ple_after["amount"]

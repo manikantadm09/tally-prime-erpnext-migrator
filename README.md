@@ -91,6 +91,10 @@ Edit the local-only files before running:
 
 `config.yaml` in this repository is a safe template. Do not run it unchanged.
 
+Set `T2E_ENV=UAT` and `T2E_RUNTIME_ROOT` to an isolated runtime directory for a
+clean remigration. The UAT client refuses frozen/production hosts
+(`*.spaceki.com`). Never point UAT credentials at production.
+
 ## Safe migration workflow
 
 All state-changing commands require `--confirm`.
@@ -112,7 +116,7 @@ python -m t2e bs-check --from-date 20240401 --to-date 20250331
 ```
 
 For a controlled, incremental run, use `load-masters`, `load-invoices`,
-`load-vouchers`, `load-openings`, `load-closing-stock`,
+`load-vouchers`, `load-bill-references`, `load-openings`, `load-closing-stock`,
 `load-ledger-fidelity`, and `load-period-closing` individually, in that order.
 `load-ledger-fidelity` compares each invoice's submitted GL with the exact
 source ledger vector and creates only balanced, same-date reclassifications for
@@ -139,8 +143,13 @@ outside the accounting-only scope (Godown, Cost Category, Tax Unit, and Voucher
 Type metadata) are explicitly marked skipped in staging instead of remaining
 misleadingly pending.
 
-Payment allocation is intentionally not applied by `run-all`. The legacy
-`reconcile-payments` command uses FIFO within each party. FIFO can be useful as
+Payment allocation is intentionally not applied by `run-all`. Voucher insert
+also does **not** attach Tally `Agst Ref` onto Journal/Payment Entry rows;
+that used to FIFO-allocate and could mark the wrong invoice Paid. After
+documents exist, `load-bill-references` plans GUID-backed named links, then
+the exact bill reconciler applies only Payment Entry / Journal Entry sources.
+
+The legacy `reconcile-payments` command uses FIFO within each party. FIFO can be useful as
 an explicitly approved ERPNext business policy, but it **does not reproduce
 Tally bill references** and can incorrectly mark deliberately open bills as
 paid. It must not be used for a Tally-fidelity migration. A live FIFO run now
@@ -222,12 +231,21 @@ live invoice/payment availability before every write, targets one named
 invoice/payment pair at a time, and verifies that active GL remains unchanged.
 It refuses Sales/Purchase Invoice rows as payment sources: ERPNext reconciles a
 return invoice by creating a same-control-account Journal Entry, which preserves
-balances but adds debit/credit turnover absent from Tally. Those cases are
-reported as `erpnext_return_reconciliation_turnover_exception`; do not feed
-them back into the ordinary exact reconciler. Negative
-differences where Tally's bill amount exceeds the underlying invoice GL are
-reported separately as `source_bill_vs_gl_exception`; never alter accounting
-entries merely to imitate such bill metadata.
+balances but adds debit/credit turnover absent from Tally.
+
+Return-classified outstanding groups are still planned, but only real
+Payment Entry / Journal Entry rows are offered as funding. First apply
+`tools/frappe_repair_return_bill_references.py` so each Debit/Credit Note's
+self-referencing Payment Ledger row points at the Tally `Agst Ref` invoice.
+Then re-run verification and `plan_exact_bill_allocations_api.py --safe-subset`.
+Do not use a return invoice itself as the payment. Rebound the repair
+manifest to the live site's document names; a previous site's `SRET-`/`PRET-`
+names will not exist after a remigration.
+
+Credit notes that Tally originated as `New Ref` (their own bill) are not
+linked onto a sales invoice. Negative differences where Tally's bill amount
+exceeds the underlying invoice GL are `source_bill_vs_gl_exception`; never
+alter accounting entries merely to imitate such bill metadata.
 
 If an earlier run allocated a real Payment Entry or Journal Entry to the wrong
 invoice, first generate a read-only unlink plan and review every named link:
@@ -253,13 +271,14 @@ excludes a party when the available real settlement documents cannot fund the
 exact Tally bill references; it never creates an artificial payment merely to
 make an invoice show `Paid`.
 
-The final Spaceki verification matched 1,366 of 1,369 migrated invoice bill
-groups. Three native-source/model exceptions remain intentionally unchanged:
+The UAT remigration matched 1,344 of 1,368 migrated invoice bill groups.
+Return-settled invoices now match Tally. These native-source/model exceptions
+remain intentionally unchanged:
 
 - MEERA ONEIL NALAVADI: native Tally bill outstanding exceeds the complete
   migrated invoice value by INR 2,431,247.
-- MAHENDRA HOMES PRIVATE LIMITED: native Tally bill outstanding exceeds its
-  complete migrated invoice value by INR 639,576.
+- MAHENDRA HOMES PRIVATE LIMITED bill `13`: native Tally bill outstanding
+  exceeds its complete migrated invoice value by INR 639,576.
 - STRONGLASS TOUGH: native Tally bill references require INR 36,000 more
   settlement capacity than all real ERPNext payment documents provide.
 
@@ -267,35 +286,35 @@ These exceptions do not affect the exact voucher GL replay, Trial Balance,
 Profit and Loss, or customer/supplier control totals. They require client-side
 source clarification, not a fabricated ERPNext accounting transaction.
 
-For the five proved Spaceki return documents, use the narrowly scoped
-server-side `tools/frappe_repair_return_bill_references.py`. It delinks the five
-self-referencing Payment Ledger rows, creates six exact Tally bill references
-(the shared ₹16,231 return is split as ₹124 + ₹16,107), and recalculates invoice
-status without creating GL Entries. It is plan-only by default, is bound to the
-exact company/documents/parties/accounts/before-and-after amounts, requires a
-real database backup for `--confirm`, and rolls back unless active GL and total
-Payment Ledger values remain unchanged:
+For Tally Debit/Credit Notes that `Agst Ref` an invoice, use the narrowly scoped
+server-side `tools/frappe_repair_return_bill_references.py`. It delinks each
+return's self-referencing Payment Ledger row, points it at the Tally target
+invoice, and recalculates outstanding without creating GL Entries. Bind the
+`REPAIRS` tuple to the live site's document names, amounts, and before/after
+outstandings (plan-only until `--confirm` with a real database backup). It
+rolls back unless active GL and total Payment Ledger values remain unchanged:
 
 ```bash
 # Run from the Frappe bench root with its Python.
 ./env/bin/python /path/to/frappe_repair_return_bill_references.py \
-  --site dev.spaceki.com \
-  --company "Spaceki Designs LLP" \
-  --confirm-company "Spaceki Designs LLP"
+  --site dev-site.local \
+  --company "YOUR ERPNext COMPANY" \
+  --confirm-company "YOUR ERPNext COMPANY"
 
 # Only after reviewing the plan and taking a fresh backup:
 ./env/bin/python /path/to/frappe_repair_return_bill_references.py \
-  --site dev.spaceki.com \
-  --company "Spaceki Designs LLP" \
-  --confirm-company "Spaceki Designs LLP" \
-  --backup /apps/frappe-bench/sites/dev.spaceki.com/private/backups/FRESH-database.sql.gz \
+  --site dev-site.local \
+  --company "YOUR ERPNext COMPANY" \
+  --confirm-company "YOUR ERPNext COMPANY" \
+  --backup /path/to/FRESH-database.sql.gz \
   --confirm --report /tmp/return_bill_reference_repair.json
 ```
 
 After applying, rerun `tools.verify_invoice_outstandings_api`,
-`tools.audit_invoice_status_api`, and `tools.verify_financials_api`. The six
-return exceptions must disappear, ordinary overdue amounts must continue to
-match Tally, and the GL replay/signature must remain exact.
+`tools.plan_exact_bill_allocations_api --safe-subset`, and
+`python -m t2e reconcile-exact-bills` (dry-run, then `--confirm`). Return
+exceptions funded by real PE/JE rows should disappear. Ordinary overdue
+amounts must continue to match Tally, and the GL signature must remain exact.
 
 If a reviewed run was interrupted after ERPNext created return-reconciliation
 JEs, cancel them with `tools.revert_generated_return_reconciliations` and use

@@ -92,8 +92,15 @@ def source_graph(vouchers: list[dict], party_types: dict[str, str]) -> tuple[dic
     return origins, funding
 
 
+SETTLEMENT_SOURCES = {"Payment Entry", "Journal Entry"}
+
+
 def payment_key(row: dict) -> tuple[str, str]:
     return str(row.get("reference_type") or ""), str(row.get("reference_name") or "")
+
+
+def is_settlement_source(key: tuple[str, str]) -> bool:
+    return key[0] in SETTLEMENT_SOURCES
 
 
 def distribute_reduction(group: dict, invoice_by_name: dict[str, dict]) -> list[dict]:
@@ -144,13 +151,15 @@ def main() -> None:
         row for row in verification["differences"]
         if money(row["difference"]) > 0
         and row.get("classification", "requires_exact_allocation")
-        == "requires_exact_allocation"
+        in (
+            "requires_exact_allocation",
+            "erpnext_return_reconciliation_turnover_exception",
+        )
     ]
-    excluded_return_groups = [
-        row for row in verification["differences"]
-        if row.get("classification")
-        == "erpnext_return_reconciliation_turnover_exception"
-    ]
+    # Return invoices stay out of payment candidates below. Remaining PE/JE
+    # funding for these groups is planned; leftover SI/PI-sourced rows are
+    # still dropped by the dynamic exclude.
+    excluded_return_groups = []
 
     erp = ERPNextClient(dry_run=True)
     defaults = fetch_company_defaults(erp)
@@ -246,7 +255,7 @@ def main() -> None:
                 candidate_guids.add(f"{invoice_guid}:party-control-bridge")
             candidate_keys = {
                 live_by_guid[guid] for guid in candidate_guids
-                if guid in live_by_guid
+                if guid in live_by_guid and is_settlement_source(live_by_guid[guid])
             }
             candidate_payments = []
             for key in sorted(candidate_keys):
@@ -301,7 +310,7 @@ def main() -> None:
             fallback_payments = []
             for key, payment_row in sorted(payments_by_key.items()):
                 available = remaining_by_key.get(key, Decimal("0.00"))
-                if available <= 0:
+                if available <= 0 or not is_settlement_source(key):
                     continue
                 payment = dict(payment_row)
                 payment["amount"] = float(available)

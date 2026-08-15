@@ -138,6 +138,13 @@ class ExactBillReconciliationTests(unittest.TestCase):
                 {"reference_type": "Purchase Invoice", "reference_name": "PRET-1"},
             )
 
+    def test_planner_keeps_only_payment_and_journal_sources(self):
+        from tools.plan_exact_bill_allocations_api import is_settlement_source
+        self.assertTrue(is_settlement_source(("Payment Entry", "PAY-1")))
+        self.assertTrue(is_settlement_source(("Journal Entry", "JV-1")))
+        self.assertFalse(is_settlement_source(("Purchase Invoice", "PRET-1")))
+        self.assertFalse(is_settlement_source(("Sales Invoice", "SRET-1")))
+
 
 if __name__ == "__main__":
     unittest.main()
