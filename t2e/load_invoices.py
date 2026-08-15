@@ -33,6 +33,11 @@ from .mapping import CompanyDefaults, LedgerResolver, Resolved
 from .staging import Staging
 
 GENERIC_ITEM = "Tally Migration Item"
+# India Compliance requires HSN/SAC on Item. 998399 is a valid SAC on this
+# CoA ("other professional/technical services") and is only a master-data
+# prerequisite so the generic non-stock item can exist; invoice tax still
+# comes from Tally tax ledgers, not this code.
+GENERIC_ITEM_HSN = "998399"
 
 # Tally voucher -> (ERPNext doctype, party kind, is_return)
 INVOICE_SPECS = {
@@ -51,6 +56,8 @@ def ensure_generic_item(erp: ERPNextClient) -> None:
         "item_group": "All Item Groups", "stock_uom": "Nos",
         "is_stock_item": 0, "is_purchase_item": 1, "is_sales_item": 1,
     }
+    if erp.has_field("Item", "gst_hsn_code"):
+        doc["gst_hsn_code"] = GENERIC_ITEM_HSN
     erp.insert("Item", doc)
 
 
@@ -104,38 +111,64 @@ class InvoiceLoader:
         # sign of return: ERPNext expects negative qty/amount
         sign = -1 if is_return else 1
 
+        account_field = (
+            "income_account" if kind == "Customer" else "expense_account"
+        )
+        control_account = (
+            self.d.receivable if kind == "Customer" else self.d.payable
+        )
         item_rows = [{
             "item_code": GENERIC_ITEM,
             "item_name": e["ledger"][:140],
             "description": _item_description(
                 e["ledger"], payload.get("NARRATION")),
             "qty": sign, "rate": round(e["mag"], 2),
-            ("income_account" if kind == "Customer" else "expense_account"):
-                (self.r.get(e["ledger"]).account if self.r.get(e["ledger"]) else self.d.suspense),
+            account_field: (
+                self.r.get(e["ledger"]).account if self.r.get(e["ledger"])
+                else self.d.suspense),
             "cost_center": self.d.cost_center,
         } for e in items]
+        # A second party ledger on the expense/income side cannot post through
+        # the invoice control account (ERPNext rejects expense == credit_to).
+        # Leave it pending for the journal loader so both parties stay in GL.
+        if any(row.get(account_field) == control_account for row in item_rows):
+            return None
 
-        tax_rows = [{
-            "charge_type": "Actual",
-            # Taxes remain explicit amounts so paise-exact Tally tax postings are
-            # preserved. Round-off is deliberately excluded and handled through
-            # ERPNext's rounded-total mechanism below.
-            "account_head": (self.r.get(e["ledger"]).account if self.r.get(e["ledger"])
-                             else self.d.round_off),
-            "description": e["ledger"][:140],
-            "rate": _tax_rate(e["ledger"]),
-            # A tax/rounding line increases the bill when it sits OPPOSITE the
-            # party line (i.e. on the items' side): on a Sale the party is a Tally
-            # DEBIT and output GST a CREDIT; on a Purchase the party is a CREDIT
-            # and input GST a DEBIT -- both additive. Judging against the party's
-            # actual Dr/Cr direction (not the doctype) keeps returns correct too:
-            # a Credit Note's party is a credit, so its output-GST debit reverses
-            # (negative tax_amount). The `sign` then applies ERPNext's return flip.
-            "tax_amount": round(
-                sign * (e["mag"] if e["debit"] != party_line["debit"]
-                        else -e["mag"]), 2),
-            "cost_center": self.d.cost_center,
-        } for e in taxes]
+        tax_rows = []
+        for e in taxes:
+            gst_kind = _gst_kind(e["ledger"])
+            row = {
+                "charge_type": "Actual",
+                # Taxes remain explicit amounts so paise-exact Tally tax postings
+                # are preserved. Round-off is deliberately excluded and handled
+                # through ERPNext's rounded-total mechanism below.
+                "account_head": (
+                    self.r.get(e["ledger"]).account if self.r.get(e["ledger"])
+                    else self.d.round_off),
+                "description": e["ledger"][:140],
+                "rate": _tax_rate(e["ledger"]),
+                # A tax/rounding line increases the bill when it sits OPPOSITE
+                # the party line (i.e. on the items' side): on a Sale the party
+                # is a Tally DEBIT and output GST a CREDIT; on a Purchase the
+                # party is a CREDIT and input GST a DEBIT -- both additive.
+                # Judging against the party's actual Dr/Cr direction (not the
+                # doctype) keeps returns correct too: a Credit Note's party is a
+                # credit, so its output-GST debit reverses (negative tax_amount).
+                # The `sign` then applies ERPNext's return flip.
+                "tax_amount": round(
+                    sign * (e["mag"] if e["debit"] != party_line["debit"]
+                            else -e["mag"]), 2),
+                "cost_center": self.d.cost_center,
+            }
+            if gst_kind:
+                row["gst_tax_type"] = gst_kind
+                # Keep charge_type Actual. On Net Total lets India Compliance
+                # recompute tax (18% vs Tally 5%, paise rounding) and the
+                # invoice no longer matches Tally. Item GST rates are stamped
+                # below by _apply_single_rate_item_gst so IC still sees tax
+                # on taxable items.
+            tax_rows.append(row)
+        _apply_single_rate_item_gst(item_rows, tax_rows)
 
         # party bill reference (New Ref) for later payment allocation
         billname = next((b["name"] for b in party_line["bills"]
@@ -190,18 +223,22 @@ class InvoiceLoader:
                     "source_total": round(source_total, 2),
                     "unrounded_total": round(unrounded_total, 2),
                 }
-        party_gstin = _scalar(payload.get("PARTYGSTIN")).strip().upper()
-        if party_gstin and not _valid_gstin(party_gstin):
-            raise ERPNextError(
-                f"Invalid source GSTIN {party_gstin!r} for {kind} "
-                f"{party_res.party}; correct it in Tally before migration"
-            )
+        party_gstin, gstin_warning = _resolve_party_gstin(
+            _scalar(payload.get("PARTYGSTIN")),
+            self._valid_source_gstin(party_res.party),
+        )
+        if gstin_warning:
+            narration = f"{narration}\n{gstin_warning}".strip()[:1000]
+            doc["remarks"] = narration
         place = _place_of_supply(
             _scalar(payload.get("PLACEOFSUPPLY"))
             or _scalar(payload.get("STATENAME")),
             party_gstin)
         company_gstin = _scalar(
             get_config().erpnext.get("company_gstin", ""))
+        place = _tax_driven_place_of_supply(
+            place, party_gstin, company_gstin,
+            [e["ledger"] for e in taxes])
         if self._supports(doctype, "place_of_supply") and place:
             doc["place_of_supply"] = place
         # India Compliance rejects the contradictory combination of a GSTIN
@@ -282,7 +319,8 @@ class InvoiceLoader:
         if limit:
             rows = rows[:limit]
         stats = {"planned": 0, "loaded": 0, "skipped": 0,
-                 "fallback": 0, "bridged": 0, "error": 0}
+                 "fallback": 0, "bridged": 0, "error": 0,
+                 "cancelled_retries": 0}
         for i, vrow in enumerate(rows, 1):
             party = doctype = billname = None
             bridge = None
@@ -323,8 +361,7 @@ class InvoiceLoader:
                     if bridge:
                         stats["bridged"] += 1
                     continue
-                res = self._insert_and_submit(
-                    doctype, doc, manual_rounding)
+                res = self._insert_invoice(doctype, doc, manual_rounding)
                 name = _name_of(res)
                 if not name:
                     name = self.erp.find_by_field(
@@ -341,7 +378,9 @@ class InvoiceLoader:
                     # that the source value survived.  Cancel the altered
                     # document and retry with the exact tax ledger amounts as
                     # explicit invoice lines, without guessing new tax data.
+                    # ERPNext keeps that cancelled shell; purge it after load.
                     self.erp.cancel(doctype, name)
+                    stats["cancelled_retries"] += 1
                     item_doctype = (
                         "Sales Invoice Item" if doctype == "Sales Invoice"
                         else "Purchase Invoice Item"
@@ -351,6 +390,7 @@ class InvoiceLoader:
                         doctype,
                         suppress_target_gst=self._supports(
                             item_doctype, "gst_treatment"),
+                        non_gst_template=f"Non-GST - {self.d.abbr}",
                     )
                     if doctype == "Sales Invoice" and exact_doc.get("name"):
                         exact_doc["name"] = self._available_name(
@@ -371,6 +411,7 @@ class InvoiceLoader:
                             doctype, name, float(vrow["amount"] or 0)):
                         if name:
                             self.erp.cancel(doctype, name)
+                            stats["cancelled_retries"] += 1
                         self.fallback.append(vrow["guid"])
                         stats["fallback"] += 1
                         continue
@@ -400,6 +441,9 @@ class InvoiceLoader:
                     self.store.add_bill_ref(
                         party, billname, doctype, existing)
                     stats["skipped"] += 1
+                elif _is_missing_item_gst_error(exc):
+                    self.fallback.append(vrow["guid"])
+                    stats["fallback"] += 1
                 else:
                     if not self.erp.dry_run:
                         self.store.mark(
@@ -445,6 +489,70 @@ class InvoiceLoader:
         data = self.erp._request(
             "GET", f"/api/resource/{dt}/{nm}")["data"]
         return int(data.get("docstatus") or 0) == 1
+
+    def _valid_source_gstin(self, party_name: str) -> str:
+        """Checksum-valid GSTIN from the staged ledger or another voucher.
+
+        A truncated/typo voucher GSTIN must not block the invoice when Tally
+        already has a valid GSTIN on the same party's ledger or on a later
+        voucher. Conflicting valid GSTINs are left unused rather than guessed.
+        """
+        if not hasattr(self, "_source_gstin"):
+            mapping: dict[str, str] = {}
+            voucher_gstins: dict[str, set[str]] = {}
+            masters = getattr(self.store, "masters", None)
+            if callable(masters):
+                for row in masters("ledger"):
+                    gstin = _scalar(
+                        json.loads(row["payload"] or "{}").get("PARTYGSTIN")
+                    ).strip().upper()
+                    if _valid_gstin(gstin):
+                        mapping[_norm(row["name"])] = gstin
+            vouchers = getattr(self.store, "vouchers", None)
+            if callable(vouchers):
+                for row in vouchers():
+                    gstin = _scalar(
+                        json.loads(row["payload"] or "{}").get("PARTYGSTIN")
+                    ).strip().upper()
+                    if not _valid_gstin(gstin):
+                        continue
+                    voucher_gstins.setdefault(
+                        _norm(row["party"]), set()).add(gstin)
+            for party, gstins in voucher_gstins.items():
+                if party in mapping:
+                    continue
+                if len(gstins) == 1:
+                    mapping[party] = next(iter(gstins))
+            self._source_gstin = mapping
+        return self._source_gstin.get(_norm(party_name), "")
+
+    def _insert_invoice(
+            self, doctype: str, doc: dict,
+            manual_rounding: dict | None):
+        """Insert the invoice; on India Compliance item-GST rejection, retry
+        with tax ledgers as explicit Non-GST lines so the Tally amount survives.
+        """
+        try:
+            return self._insert_and_submit(doctype, doc, manual_rounding)
+        except ERPNextError as exc:
+            if not _is_missing_item_gst_error(exc):
+                raise
+            item_doctype = (
+                "Sales Invoice Item" if doctype == "Sales Invoice"
+                else "Purchase Invoice Item"
+            )
+            exact_doc = _taxes_as_invoice_items(
+                doc,
+                doctype,
+                suppress_target_gst=self._supports(
+                    item_doctype, "gst_treatment"),
+                non_gst_template=f"Non-GST - {self.d.abbr}",
+            )
+            if doctype == "Sales Invoice" and exact_doc.get("name"):
+                exact_doc["name"] = self._available_name(
+                    doctype, exact_doc["name"])
+            return self._insert_and_submit(
+                doctype, exact_doc, manual_rounding)
 
     def _insert_and_submit(
             self, doctype: str, doc: dict,
@@ -550,7 +658,8 @@ def _norm(value) -> str:
 
 
 def _taxes_as_invoice_items(
-        doc: dict, doctype: str, *, suppress_target_gst: bool = False) -> dict:
+        doc: dict, doctype: str, *, suppress_target_gst: bool = False,
+        non_gst_template: str = "") -> dict:
     """Preserve exact tax-ledger postings when target tax hooks rewrite rows.
 
     The normal path continues to use ERPNext's Taxes table. This representation
@@ -585,11 +694,15 @@ def _taxes_as_invoice_items(
         # submit time even after explicit taxes are removed.  Mark only this
         # exact-ledger fallback representation Non-GST so it does not fabricate
         # a second tax.  The source tax ledgers remain explicit invoice lines.
+        template = non_gst_template or "Non-GST"
         for item in exact.get("items") or []:
             item["gst_treatment"] = "Non-GST"
             item["gst_hsn_code"] = ""
-            item["item_tax_template"] = ""
+            item["item_tax_template"] = template
             item["item_tax_rate"] = "{}"
+            for kind in ("igst", "cgst", "sgst", "cess"):
+                item[f"{kind}_rate"] = 0
+                item[f"{kind}_amount"] = 0
     return exact
 
 
@@ -602,6 +715,37 @@ def _bankers_round_to_rupee(value: float) -> float:
 def _error_detail(exc: ERPNextError) -> str:
     body = getattr(exc, "body", None)
     return f"{exc}: {body}" if body else str(exc)
+
+
+def _is_missing_item_gst_error(exc: ERPNextError) -> bool:
+    text = f"{exc} {getattr(exc, 'body', '') or ''}"
+    return "No GST is being charged on Taxable Items" in text
+
+
+def _resolve_party_gstin(voucher_gstin: str, ledger_gstin: str) -> tuple[str, str]:
+    """Return a checksum-valid GSTIN without inventing a replacement.
+
+    Prefer the voucher GSTIN when it is valid. If it is missing or fails
+    checksum/shape, use a valid ledger-master GSTIN. Otherwise omit it and
+    keep the exact Tally string in a remark — never block the invoice.
+    """
+    voucher = (voucher_gstin or "").strip().upper()
+    ledger = (ledger_gstin or "").strip().upper()
+    if _valid_gstin(voucher):
+        return voucher, ""
+    if _valid_gstin(ledger):
+        if voucher and voucher != ledger:
+            return ledger, (
+                f"[Migration: voucher GSTIN {voucher} is not a valid GSTIN; "
+                f"used Tally source GSTIN {ledger}.]"
+            )
+        return ledger, ""
+    if voucher:
+        return "", (
+            f"[Migration: Tally GSTIN {voucher} is not a valid GSTIN and was "
+            "omitted from ERPNext GSTIN fields.]"
+        )
+    return "", ""
 
 
 def _scalar(value) -> str:
