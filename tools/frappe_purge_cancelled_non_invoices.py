@@ -155,10 +155,15 @@ def main() -> int:
 
             # A superseded derived bridge may legitimately have no document
             # with the derived identity while its base source voucher remains
-            # active.  This rule accepts only that exact, inspectable suffix.
+            # active.  These suffixes are the only inspectable derived keys.
             base_targets = []
-            if guid.endswith(":party-control-bridge"):
-                base_guid = guid.removesuffix(":party-control-bridge")
+            derived_suffix = None
+            for suffix in (":party-control-bridge", ":ledger-fidelity-bridge"):
+                if guid.endswith(suffix):
+                    derived_suffix = suffix
+                    break
+            if derived_suffix:
+                base_guid = guid.removesuffix(derived_suffix)
                 for target_doctype in ACTIVE_REPLACEMENT_DOCTYPES:
                     target = frappe.db.get_value(
                         target_doctype,

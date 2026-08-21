@@ -798,7 +798,7 @@ def main(argv=None) -> int:
     vac = sub.add_parser(
         "repair-vendor-advance-control",
         help="one Current Assets Advances to Vendors leaf; keep suppliers; "
-             "reclass Creditors debit (UAT only)")
+             "reclass Creditors debit (UAT/DEV only; never PRD)")
     vac.add_argument("--confirm", action="store_true", help="execute writes")
     vac.add_argument(
         "--reopen-period-closings", action="store_true",

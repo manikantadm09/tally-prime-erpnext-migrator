@@ -30,16 +30,29 @@ def _closed_fiscal_year(erp: ERPNextClient, field: str, vdate: str | None) -> st
     return fy if erp.find_by_field("Period Closing Voucher", field, key) else None
 
 
+def _invoice_payable_total(row: dict) -> float:
+    """Amount ERPNext tracks outstanding against (rounded when enabled)."""
+    if not int(row.get("disable_rounded_total") or 0):
+        rounded = float(row.get("rounded_total") or 0)
+        if rounded:
+            return rounded
+    return float(row.get("grand_total") or 0)
+
+
 def _invoice_has_allocations(erp: ERPNextClient, doctype: str, name: str) -> bool:
     if doctype not in ("Sales Invoice", "Purchase Invoice"):
         return False
     rows = erp.get_list(
-        doctype, fields=["outstanding_amount", "grand_total"],
+        doctype,
+        fields=[
+            "outstanding_amount", "grand_total", "rounded_total",
+            "disable_rounded_total",
+        ],
         filters=[["name", "=", name]], limit=1)
     if not rows:
         return False
     outstanding = float(rows[0].get("outstanding_amount") or 0)
-    total = float(rows[0].get("grand_total") or 0)
+    total = _invoice_payable_total(rows[0])
     return abs(outstanding - total) > 0.01
 
 

@@ -170,12 +170,13 @@ class InvoiceLoader:
             tax_rows.append(row)
         _apply_single_rate_item_gst(item_rows, tax_rows)
 
-        # party bill reference (New Ref) for later payment allocation
-        billname = next((b["name"] for b in party_line["bills"]
-                         if b["type"] in ("New Ref", "Agst Ref")), None) \
-            or vrow["vnumber"] or vrow["guid"][:20]
-        bill = next((b for b in party_line["bills"]
-                     if b["type"] in ("New Ref", "Agst Ref")), {})
+        # party bill reference (New Ref) for later payment allocation.
+        # Prefer New Ref over Agst Ref so due_date comes from this invoice's
+        # own bill, not an older bill being adjusted against.
+        bill = next((b for b in party_line["bills"] if b["type"] == "New Ref"), None) \
+            or next((b for b in party_line["bills"] if b["type"] == "Agst Ref"), None) \
+            or {}
+        billname = bill.get("name") or vrow["vnumber"] or vrow["guid"][:20]
         posting_date = vrow["vdate"]
         bill_date = (
             _tally_date(bill.get("bill_date"))
@@ -184,6 +185,8 @@ class InvoiceLoader:
         )
         due_date = _due_date(
             bill_date or posting_date, bill.get("credit_period"))
+        if due_date < posting_date:
+            due_date = posting_date
         narration = _scalar(payload.get("NARRATION"))[:1000]
 
         doc = {

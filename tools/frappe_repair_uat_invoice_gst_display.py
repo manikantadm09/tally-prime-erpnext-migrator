@@ -25,6 +25,7 @@ from t2e.load_invoices import _allocate_money, _gst_kind, _tax_rate  # noqa: E40
 
 PENNY = Decimal("0.01")
 SITE = "dev-site.local"
+ALLOWED_SITES = ("dev-site.local", "dev.spaceki.com")
 COMPANY = "Spaceki Designs LLP"
 GST_KINDS = ("cgst", "sgst", "igst", "cess")
 
@@ -314,8 +315,8 @@ def main() -> int:
     parser.add_argument("--report")
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
-    if args.site != SITE:
-        raise SystemExit(f"bound to {SITE}")
+    if args.site not in ALLOWED_SITES:
+        raise SystemExit(f"bound to {ALLOWED_SITES}, not {args.site}")
     if args.company != args.confirm_company:
         raise SystemExit("company confirmation mismatch")
     if args.confirm:

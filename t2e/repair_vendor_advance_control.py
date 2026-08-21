@@ -277,10 +277,10 @@ class VendorAdvanceControlRepair:
 
     def run(self, *, reopen_period_closings: bool = False,
             rebuild_year_ends: bool = False) -> dict[str, Any]:
-        if self.cfg.env_name != "UAT":
+        if self.cfg.env_name not in ("UAT", "DEV"):
             raise ERPNextError(
-                "vendor-advance-control repair is UAT-only "
-                f"(env={self.cfg.env_name})")
+                "vendor-advance-control repair is UAT/DEV only "
+                f"(env={self.cfg.env_name}); refuse production")
         plan = self.plan(rebuild_year_ends=rebuild_year_ends)
         report: dict[str, Any] = {
             "plan_only": self.erp.dry_run,

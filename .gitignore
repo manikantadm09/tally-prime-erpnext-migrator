@@ -3,17 +3,26 @@
 .env.erpnext
 .env
 runtime-uat/.env.erpnext
+runtime-dev/.env.erpnext
+runtime-prd/.env.erpnext
 
-# runtime artifacts
+# runtime artifacts (site-local staging / reports)
 data/
-runtime-uat/data/
-*.sqlite
+runtime-dev/
+runtime-prd/
+runtime-uat/
 *.sqlite
 *.sqlite-journal
 *.log
 *.xml
 *.pdf
 config.local.yaml
+
+# one-off local plans / apply results
+agst_ref_*.json
+party_control_*.json
+post_pcv_rebuild_*.json
+DESKTOP_UAT.txt
 
 tallytoerpnext-desktop-uat.tar.gz
 
