@@ -111,7 +111,7 @@ python -m t2e run-all --confirm
 
 # 4. Re-run reconciliation and financial checks.
 python -m t2e reconcile
-python -m t2e pl-check --from-date 20240401 --to-date 20250331
+python -m t2e pl-check --from-date 20240401 --to-date 20250331  ## this depends on from when client data is
 python -m t2e bs-check --from-date 20240401 --to-date 20250331
 ```
 

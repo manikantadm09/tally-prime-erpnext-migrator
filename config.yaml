@@ -5,11 +5,11 @@
 # non-secret mapping/runtime configuration only.
 
 tally:
-  url: "http://127.0.0.1:9000"
-  company: "YOUR TALLY COMPANY"    # Tally company to export (must be loaded/open)
-  from_date: "20240101"             # yyyymmdd; set the first source date to migrate
-  to_date:   "20241231"             # yyyymmdd; set the approved migration cut-off
-  request_timeout: 180             # seconds; large voucher exports can be slow
+  url: "http://127.0.0.1:9001"
+  company: "Sanrad Medical Systems Private Limited"    # Tally company to export (must be loaded/open)
+  from_date: "20110401"             # yyyymmdd; Wave 1 start (FY11-12)
+  to_date:   "20130331"             # yyyymmdd; Wave 1 end (FY12-13)
+  request_timeout: 600             # seconds; large voucher exports can be slow
   page_size: 0                     # 0 = export whole collection in one request
   # Routine extracts begin this many days behind a clean checkpoint, so recent
   # Tally edits/cancellations are detected without re-reading all history.
@@ -18,7 +18,7 @@ tally:
   # (for example http://192.168.1.5:9000 or the Windows Tally gateway port).
 
 erpnext:
-  company: "YOUR ERPNext COMPANY"  # isolated ERPNext sandbox target
+  company: "Sanrad Medical Systems Private Limited"  # isolated ERPNext sandbox target
   default_currency: "INR"
   country: "India"
   company_state: ""
